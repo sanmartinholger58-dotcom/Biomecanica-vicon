@@ -988,7 +988,7 @@ def main():
 
     if not run:
         info_box(
-            "Sube al menos el archivo de fuerza. El programa detecta automáticamente las plataformas, combina la GRF vertical, identifica el salto principal y marca la confiabilidad de cada resultado.",
+            "Sube al menos el archivo de fuerza.",
             "info",
         )
         return
