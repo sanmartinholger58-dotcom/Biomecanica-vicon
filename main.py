@@ -1,3 +1,5 @@
+
+
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║         PLATAFORMA DE ANÁLISIS BIOMECÁNICO DE SALTOS — Sistema Vicon         ║
@@ -822,6 +824,12 @@ def compute_kinematics(traj: pd.DataFrame, qdf: pd.DataFrame) -> Tuple[pd.DataFr
             C = [row[f"{C_m}_X"], row[f"{C_m}_Y"], row[f"{C_m}_Z"]]
             vals.append(vec_angle(A, B, C))
         angles[name] = vals
+        # Referencia de flexión/extensión estimada:
+        # El ángulo calculado es interno geométrico. Para facilitar la lectura clínica,
+        # se agrega una referencia donde 0° ≈ extensión y valores mayores ≈ mayor flexión.
+        # Esta conversión es especialmente directa para rodilla; en cadera/tobillo se usa
+        # como ayuda visual y debe interpretarse junto con el ángulo interno original.
+        angles[f"{name}_flexion"] = np.clip(180.0 - pd.Series(vals, dtype=float), 0, 180)
         valid_pct = float(pd.Series(vals).notna().mean() * 100)
         # Filtro para cambios irreales: grandes saltos de un frame a otro.
         jumps = pd.Series(vals).diff().abs()
@@ -924,10 +932,490 @@ def plot_angles(angles: pd.DataFrame, side: str) -> Optional[go.Figure]:
             fig.add_trace(go.Scatter(x=angles["time"], y=angles[col], name=f"{name} ({'Izq.' if side == 'L' else 'Der.'})", line=dict(width=2)))
     if len(fig.data) == 0:
         return None
-    fig.update_layout(**base_layout(f"Ángulos Articulares - {'Izquierdo' if side == 'L' else 'Derecho'}", 350))
+    fig.update_layout(**base_layout(f"Ángulos internos geométricos - {'Izquierdo' if side == 'L' else 'Derecho'}", 350))
     fig.update_xaxes(title_text="Tiempo (s)")
-    fig.update_yaxes(title_text="Ángulo (°)")
+    fig.update_yaxes(title_text="Ángulo interno (°)")
     return fig
+
+
+def plot_angles_flexion(angles: pd.DataFrame, side: str) -> Optional[go.Figure]:
+    """Muestra una referencia clínica simplificada: mayor valor = mayor flexión."""
+    if angles is None or angles.empty:
+        return None
+    fig = go.Figure()
+    labels = {"knee": "Rodilla", "hip": "Cadera", "ankle": "Tobillo"}
+    for joint, name in labels.items():
+        col = f"{joint}_{side}_flexion"
+        if col in angles.columns and angles[col].notna().any():
+            fig.add_trace(go.Scatter(
+                x=angles["time"], y=angles[col],
+                name=f"{name} ({'Izq.' if side == 'L' else 'Der.'})",
+                line=dict(width=2),
+            ))
+    if len(fig.data) == 0:
+        return None
+    fig.update_layout(**base_layout(f"Flexión/extensión estimada - {'Izquierdo' if side == 'L' else 'Derecho'}", 350))
+    fig.update_xaxes(title_text="Tiempo (s)")
+    fig.update_yaxes(title_text="Referencia de flexión (°) | 0° ≈ postura extendida")
+    fig.add_hline(y=0, line_dash="dot", line_color=COLORS["secondary"], opacity=0.6,
+                  annotation_text="0° ≈ extensión", annotation_font_color=COLORS["secondary"])
+    return fig
+
+
+# Conexiones para visualizador tipo exoesqueleto.
+# Se usan los marcadores disponibles en el archivo; si alguno falta, ese segmento no se dibuja.
+SKELETON_SEGMENTS = [
+    ("LASI", "RASI", "Pelvis"),
+    ("LASI", "LTHI", "Muslo izquierdo"), ("LTHI", "LKNE", "Muslo izquierdo"),
+    ("LKNE", "LANK", "Pierna izquierda"), ("LANK", "LTOE", "Pie izquierdo"),
+    ("RASI", "RTHI", "Muslo derecho"), ("RTHI", "RKNE", "Muslo derecho"),
+    ("RKNE", "RANK", "Pierna derecha"), ("RANK", "RTOE", "Pie derecho"),
+]
+
+SKELETON_MARKERS = sorted(set([m for a, b, _ in SKELETON_SEGMENTS for m in [a, b]]))
+
+
+def get_marker_point(row: pd.Series, marker: str) -> Optional[np.ndarray]:
+    cols = [f"{marker}_X", f"{marker}_Y", f"{marker}_Z"]
+    if not all(c in row.index for c in cols):
+        return None
+    p = np.array([safe_float(row[cols[0]]), safe_float(row[cols[1]]), safe_float(row[cols[2]])], dtype=float)
+    if np.any(~np.isfinite(p)):
+        return None
+    return p
+
+
+def pelvis_center(row: pd.Series) -> Optional[np.ndarray]:
+    """Centro pélvico aproximado para estabilizar el visualizador."""
+    lasi = get_marker_point(row, "LASI")
+    rasi = get_marker_point(row, "RASI")
+    if lasi is not None and rasi is not None:
+        return (lasi + rasi) / 2.0
+    return lasi if lasi is not None else rasi
+
+
+def marker_point_display(row: pd.Series, marker: str, center_on_pelvis: bool = True) -> Optional[np.ndarray]:
+    p = get_marker_point(row, marker)
+    if p is None:
+        return None
+    if center_on_pelvis:
+        c = pelvis_center(row)
+        if c is not None:
+            p = p - c
+    return p
+
+
+def global_skeleton_limits(traj: pd.DataFrame, center_on_pelvis: bool, axes=(0, 2)) -> Tuple[List[float], List[float]]:
+    """Rangos robustos para evitar que un marcador atípico agrande demasiado la gráfica."""
+    xs, ys = [], []
+    for _, r in traj.iterrows():
+        for m in SKELETON_MARKERS:
+            p = marker_point_display(r, m, center_on_pelvis=center_on_pelvis)
+            if p is not None:
+                xs.append(p[axes[0]])
+                ys.append(p[axes[1]])
+    if not xs or not ys:
+        return [-500, 500], [-500, 500]
+    x0, x1 = np.nanpercentile(xs, [2, 98])
+    y0, y1 = np.nanpercentile(ys, [2, 98])
+    pad_x = max((x1 - x0) * 0.15, 80)
+    pad_y = max((y1 - y0) * 0.15, 80)
+    return [float(x0 - pad_x), float(x1 + pad_x)], [float(y0 - pad_y), float(y1 + pad_y)]
+
+
+def skeleton_segments_for_side(side: str) -> List[Tuple[str, str, str]]:
+    if side == "Izquierdo":
+        return [s for s in SKELETON_SEGMENTS if s[0].startswith("L") or s[1].startswith("L")]
+    if side == "Derecho":
+        return [s for s in SKELETON_SEGMENTS if s[0].startswith("R") or s[1].startswith("R")]
+    return SKELETON_SEGMENTS
+
+
+def plane_indices(plane: str) -> Tuple[int, int, str, str]:
+    mapping = {
+        "X-Z": (0, 2, "X (mm)", "Z / altura (mm)"),
+        "Y-Z": (1, 2, "Y (mm)", "Z / altura (mm)"),
+        "X-Y": (0, 1, "X (mm)", "Y (mm)"),
+    }
+    return mapping.get(plane, mapping["X-Z"])
+
+
+def plot_skeleton_2d(
+    traj: pd.DataFrame,
+    idx: int,
+    plane: str = "X-Z",
+    side: str = "Ambos",
+    center_on_pelvis: bool = True,
+    show_labels: bool = False,
+) -> Optional[go.Figure]:
+    if traj is None or traj.empty:
+        return None
+    idx = int(np.clip(idx, 0, len(traj) - 1))
+    row = traj.iloc[idx]
+    ix, iy, x_title, y_title = plane_indices(plane)
+    segments = skeleton_segments_for_side(side)
+
+    fig = go.Figure()
+    drawn = 0
+    for a, b, label in segments:
+        pa = marker_point_display(row, a, center_on_pelvis=center_on_pelvis)
+        pb = marker_point_display(row, b, center_on_pelvis=center_on_pelvis)
+        if pa is None or pb is None:
+            continue
+        fig.add_trace(go.Scatter(
+            x=[pa[ix], pb[ix]], y=[pa[iy], pb[iy]],
+            mode="lines+markers+text" if show_labels else "lines+markers",
+            text=[a, b] if show_labels else None,
+            textposition="top center",
+            name=label, line=dict(width=6), marker=dict(size=9),
+            showlegend=True,
+        ))
+        drawn += 1
+
+    if drawn == 0:
+        return None
+
+    x_range, y_range = global_skeleton_limits(traj, center_on_pelvis=center_on_pelvis, axes=(ix, iy))
+    t = safe_float(row.get("time"), 0)
+    title_suffix = " | centrado en pelvis" if center_on_pelvis else " | coordenadas globales"
+    fig.update_layout(**base_layout(f"Visualizador 2D del movimiento | Frame {int(row['Frame'])} | t = {t:.3f} s{title_suffix}", 520))
+    fig.update_xaxes(title_text=x_title, range=x_range)
+    fig.update_yaxes(title_text=y_title, range=y_range, scaleanchor="x", scaleratio=1)
+    return fig
+
+
+
+
+def stable_scene_3d(traj: pd.DataFrame, center_on_pelvis: bool = True) -> dict:
+    """Escena 3D estable: mantiene rangos, aspecto y cámara fijos para reducir fatiga visual."""
+    x_range, _ = global_skeleton_limits(traj, center_on_pelvis=center_on_pelvis, axes=(0, 2))
+    y_range, z_range = global_skeleton_limits(traj, center_on_pelvis=center_on_pelvis, axes=(1, 2))
+
+    dx = max(x_range[1] - x_range[0], 1.0)
+    dy = max(y_range[1] - y_range[0], 1.0)
+    dz = max(z_range[1] - z_range[0], 1.0)
+    max_span = max(dx, dy, dz)
+    aspectratio = dict(x=dx / max_span, y=dy / max_span, z=dz / max_span)
+
+    return dict(
+        xaxis=dict(title='X (mm)', gridcolor=COLORS['grid'], range=x_range, showbackground=True, backgroundcolor='rgba(13,27,42,0.35)'),
+        yaxis=dict(title='Y (mm)', gridcolor=COLORS['grid'], range=y_range, showbackground=True, backgroundcolor='rgba(13,27,42,0.35)'),
+        zaxis=dict(title='Z / altura (mm)', gridcolor=COLORS['grid'], range=z_range, showbackground=True, backgroundcolor='rgba(13,27,42,0.35)'),
+        aspectmode='manual',
+        aspectratio=aspectratio,
+        dragmode='turntable',
+        camera=dict(
+            projection=dict(type='orthographic'),
+            eye=dict(x=1.7, y=1.45, z=0.95),
+            up=dict(x=0, y=0, z=1),
+            center=dict(x=0, y=0, z=0),
+        ),
+    )
+
+def plot_skeleton_3d(
+    traj: pd.DataFrame,
+    idx: int,
+    side: str = "Ambos",
+    center_on_pelvis: bool = True,
+    show_labels: bool = False,
+) -> Optional[go.Figure]:
+    if traj is None or traj.empty:
+        return None
+    idx = int(np.clip(idx, 0, len(traj) - 1))
+    row = traj.iloc[idx]
+    segments = skeleton_segments_for_side(side)
+
+    fig = go.Figure()
+    drawn = 0
+    for a, b, label in segments:
+        pa = marker_point_display(row, a, center_on_pelvis=center_on_pelvis)
+        pb = marker_point_display(row, b, center_on_pelvis=center_on_pelvis)
+        if pa is None or pb is None:
+            continue
+        fig.add_trace(go.Scatter3d(
+            x=[pa[0], pb[0]], y=[pa[1], pb[1]], z=[pa[2], pb[2]],
+            mode="lines+markers+text" if show_labels else "lines+markers",
+            text=[a, b] if show_labels else None,
+            textposition="top center",
+            name=label, line=dict(width=8), marker=dict(size=5),
+            showlegend=True,
+        ))
+        drawn += 1
+
+    if drawn == 0:
+        return None
+
+    scene = stable_scene_3d(traj, center_on_pelvis=center_on_pelvis)
+
+    t = safe_float(row.get("time"), 0)
+    title_suffix = " | centrado en pelvis" if center_on_pelvis else " | coordenadas globales"
+    fig.update_layout(**base_layout(f"Visualizador 3D del movimiento | Frame {int(row['Frame'])} | t = {t:.3f} s{title_suffix}", 560))
+    fig.update_layout(scene=scene, uirevision='skeleton3d_static')
+    return fig
+
+
+
+def angle_summary_for_frame(angles: Optional[pd.DataFrame], idx: int, side: str = "Ambos") -> str:
+    """Texto breve de ángulos para mostrar durante la animación."""
+    if angles is None or angles.empty:
+        return ""
+    idx = int(np.clip(idx, 0, len(angles) - 1))
+    row = angles.iloc[idx]
+    items = []
+    pairs = []
+    if side in ["Ambos", "Izquierdo"]:
+        pairs += [("knee_L_flexion", "Rod L"), ("hip_L_flexion", "Cad L"), ("ankle_L_flexion", "Tob L")]
+    if side in ["Ambos", "Derecho"]:
+        pairs += [("knee_R_flexion", "Rod R"), ("hip_R_flexion", "Cad R"), ("ankle_R_flexion", "Tob R")]
+    for col, label in pairs:
+        if col in row.index:
+            v = safe_float(row.get(col))
+            if np.isfinite(v):
+                items.append(f"{label}: {v:.0f}°")
+    return " | ".join(items[:6])
+
+
+def frame_indices_for_animation(traj: pd.DataFrame, stride: int, max_frames: int = 350) -> List[int]:
+    """Reduce frames para que la animación sea ligera en Streamlit Cloud."""
+    n = len(traj)
+    if n <= 0:
+        return []
+    stride = max(1, int(stride))
+    idxs = list(range(0, n, stride))
+    if idxs[-1] != n - 1:
+        idxs.append(n - 1)
+    if len(idxs) > max_frames:
+        idxs = np.linspace(0, n - 1, max_frames).astype(int).tolist()
+        idxs = sorted(set(idxs))
+    return idxs
+
+
+def skeleton_trace_data_2d(
+    traj: pd.DataFrame,
+    idx: int,
+    plane: str,
+    side: str,
+    center_on_pelvis: bool,
+    show_labels: bool,
+) -> List[go.Scatter]:
+    row = traj.iloc[int(np.clip(idx, 0, len(traj) - 1))]
+    ix, iy, _, _ = plane_indices(plane)
+    traces = []
+    for a, b, label in skeleton_segments_for_side(side):
+        pa = marker_point_display(row, a, center_on_pelvis=center_on_pelvis)
+        pb = marker_point_display(row, b, center_on_pelvis=center_on_pelvis)
+        if pa is None or pb is None:
+            x, y, text = [None, None], [None, None], ["", ""]
+        else:
+            x, y = [pa[ix], pb[ix]], [pa[iy], pb[iy]]
+            text = [a, b] if show_labels else ["", ""]
+        traces.append(go.Scatter(
+            x=x, y=y,
+            mode="lines+markers+text" if show_labels else "lines+markers",
+            text=text,
+            textposition="top center",
+            name=label,
+            line=dict(width=6),
+            marker=dict(size=9),
+            showlegend=True,
+        ))
+    return traces
+
+
+def skeleton_trace_data_3d(
+    traj: pd.DataFrame,
+    idx: int,
+    side: str,
+    center_on_pelvis: bool,
+    show_labels: bool,
+) -> List[go.Scatter3d]:
+    row = traj.iloc[int(np.clip(idx, 0, len(traj) - 1))]
+    traces = []
+    for a, b, label in skeleton_segments_for_side(side):
+        pa = marker_point_display(row, a, center_on_pelvis=center_on_pelvis)
+        pb = marker_point_display(row, b, center_on_pelvis=center_on_pelvis)
+        if pa is None or pb is None:
+            x, y, z, text = [None, None], [None, None], [None, None], ["", ""]
+        else:
+            x, y, z = [pa[0], pb[0]], [pa[1], pb[1]], [pa[2], pb[2]]
+            text = [a, b] if show_labels else ["", ""]
+        traces.append(go.Scatter3d(
+            x=x, y=y, z=z,
+            mode="lines+markers+text" if show_labels else "lines+markers",
+            text=text,
+            textposition="top center",
+            name=label,
+            line=dict(width=8),
+            marker=dict(size=5),
+            showlegend=True,
+        ))
+    return traces
+
+
+def plot_skeleton_2d_animation(
+    traj: pd.DataFrame,
+    angles: Optional[pd.DataFrame] = None,
+    plane: str = "X-Z",
+    side: str = "Ambos",
+    center_on_pelvis: bool = True,
+    show_labels: bool = False,
+    stride: int = 1,
+    frame_duration_ms: int = 60,
+) -> Optional[go.Figure]:
+    """Animación tipo video en Plotly. No depende del slider de Streamlit, por eso responde sin soltar el control."""
+    if traj is None or traj.empty:
+        return None
+    idxs = frame_indices_for_animation(traj, stride=stride)
+    if not idxs:
+        return None
+    ix, iy, x_title, y_title = plane_indices(plane)
+    x_range, y_range = global_skeleton_limits(traj, center_on_pelvis=center_on_pelvis, axes=(ix, iy))
+    initial_idx = idxs[0]
+    fig = go.Figure(data=skeleton_trace_data_2d(traj, initial_idx, plane, side, center_on_pelvis, show_labels))
+
+    frames = []
+    slider_steps = []
+    for idx in idxs:
+        row = traj.iloc[idx]
+        t = safe_float(row.get("time"), 0)
+        summary = angle_summary_for_frame(angles, idx, side)
+        title = f"Video 2D del movimiento | Frame {int(row['Frame'])} | t = {t:.3f} s"
+        if summary:
+            title += f"<br><sup>Flexión/extensión estimada: {summary}</sup>"
+        frame_name = str(idx)
+        frames.append(go.Frame(
+            name=frame_name,
+            data=skeleton_trace_data_2d(traj, idx, plane, side, center_on_pelvis, show_labels),
+            layout=go.Layout(title=dict(text=title)),
+        ))
+        slider_steps.append(dict(
+            method="animate",
+            args=[[frame_name], dict(mode="immediate", frame=dict(duration=0, redraw=True), transition=dict(duration=0))],
+            label=str(int(row["Frame"])),
+        ))
+
+    fig.frames = frames
+    base = base_layout("Video 2D del movimiento", 540)
+    base.update(
+        margin=dict(l=55, r=25, t=75, b=55),
+        xaxis=dict(title=x_title, range=x_range, gridcolor=COLORS["grid"], zerolinecolor=COLORS["grid"]),
+        yaxis=dict(title=y_title, range=y_range, gridcolor=COLORS["grid"], zerolinecolor=COLORS["grid"], scaleanchor="x", scaleratio=1),
+        updatemenus=[dict(
+            type="buttons",
+            direction="left",
+            x=0.98,
+            y=1.10,
+            xanchor="right",
+            yanchor="top",
+            showactive=False,
+            buttons=[
+                dict(label="▶", method="animate", args=[None, dict(frame=dict(duration=frame_duration_ms, redraw=True), transition=dict(duration=0), fromcurrent=True, mode="immediate")]),
+                dict(label="⏸", method="animate", args=[[None], dict(frame=dict(duration=0, redraw=False), transition=dict(duration=0), mode="immediate")]),
+            ],
+        )],
+        sliders=[dict(
+            active=0,
+            currentvalue=dict(prefix="Frame: ", font=dict(color=COLORS["text"])),
+            pad=dict(t=45),
+            steps=slider_steps,
+        )],
+    )
+    fig.update_layout(**base)
+    return fig
+
+
+def plot_skeleton_3d_animation(
+    traj: pd.DataFrame,
+    angles: Optional[pd.DataFrame] = None,
+    side: str = "Ambos",
+    center_on_pelvis: bool = True,
+    show_labels: bool = False,
+    stride: int = 1,
+    frame_duration_ms: int = 70,
+) -> Optional[go.Figure]:
+    """Animación 3D tipo video en Plotly."""
+    if traj is None or traj.empty:
+        return None
+    idxs = frame_indices_for_animation(traj, stride=stride, max_frames=220)
+    if not idxs:
+        return None
+    scene = stable_scene_3d(traj, center_on_pelvis=center_on_pelvis)
+
+    initial_idx = idxs[0]
+    fig = go.Figure(data=skeleton_trace_data_3d(traj, initial_idx, side, center_on_pelvis, show_labels))
+    frames = []
+    slider_steps = []
+    for idx in idxs:
+        row = traj.iloc[idx]
+        t = safe_float(row.get("time"), 0)
+        summary = angle_summary_for_frame(angles, idx, side)
+        title = f"Video 3D del movimiento | Frame {int(row['Frame'])} | t = {t:.3f} s"
+        if summary:
+            title += f"<br><sup>Flexión/extensión estimada: {summary}</sup>"
+        frame_name = str(idx)
+        frames.append(go.Frame(
+            name=frame_name,
+            data=skeleton_trace_data_3d(traj, idx, side, center_on_pelvis, show_labels),
+            layout=go.Layout(title=dict(text=title), scene=scene),
+        ))
+        slider_steps.append(dict(
+            method="animate",
+            args=[[frame_name], dict(mode="immediate", frame=dict(duration=0, redraw=True), transition=dict(duration=0))],
+            label=str(int(row["Frame"])),
+        ))
+
+    fig.frames = frames
+    base = base_layout("Video 3D del movimiento", 570)
+    base.update(
+        margin=dict(l=55, r=25, t=75, b=55),
+        scene=scene,
+        updatemenus=[dict(
+            type="buttons",
+            direction="left",
+            x=0.98,
+            y=1.08,
+            xanchor="right",
+            yanchor="top",
+            showactive=False,
+            buttons=[
+                dict(label="▶", method="animate", args=[None, dict(frame=dict(duration=frame_duration_ms, redraw=True), transition=dict(duration=0), fromcurrent=True, mode="immediate")]),
+                dict(label="⏸", method="animate", args=[[None], dict(frame=dict(duration=0, redraw=False), transition=dict(duration=0), mode="immediate")]),
+            ],
+        )],
+        sliders=[dict(
+            active=0,
+            currentvalue=dict(prefix="Frame: ", font=dict(color=COLORS["text"])),
+            pad=dict(t=45),
+            steps=slider_steps,
+        )],
+    )
+    fig.update_layout(**base, uirevision='skeleton3d_anim_static')
+    return fig
+
+def current_angles_table(angles: pd.DataFrame, idx: int) -> pd.DataFrame:
+    names = {
+        "knee_L": "Rodilla izquierda", "knee_R": "Rodilla derecha",
+        "hip_L": "Cadera izquierda", "hip_R": "Cadera derecha",
+        "ankle_L": "Tobillo izquierdo", "ankle_R": "Tobillo derecho",
+    }
+    idx = int(np.clip(idx, 0, len(angles) - 1))
+    row = angles.iloc[idx]
+    rows = []
+    for key, label in names.items():
+        if key in angles.columns:
+            internal = safe_float(row.get(key))
+            flexion = safe_float(row.get(f"{key}_flexion"))
+            rows.append({
+                "Articulación": label,
+                "Ángulo interno (°)": internal if np.isfinite(internal) else np.nan,
+                "Flexión/extensión estimada (°)": flexion if np.isfinite(flexion) else np.nan,
+                "Lectura rápida": (
+                    "posición más extendida" if np.isfinite(flexion) and flexion <= 20 else
+                    "flexión moderada/alta" if np.isfinite(flexion) and flexion >= 45 else
+                    "flexión baja/moderada" if np.isfinite(flexion) else "—"
+                ),
+            })
+    return pd.DataFrame(rows)
 
 
 def plot_com(traj: pd.DataFrame, res: Dict) -> Optional[go.Figure]:
@@ -961,7 +1449,6 @@ def main():
         """
         <div class="hero-header">
             <h1>Plataforma General de Análisis Biomecánico de Saltos</h1>
-            <p>Vicon Nexus / Force Plates | Fuerza + trayectoria | Detección automática con control de calidad</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -986,76 +1473,114 @@ def main():
         max_interp_gap = st.slider("Interpolación máxima de huecos (frames)", 0, 30, 10)
         run = st.button("▶ CALCULAR ANÁLISIS", use_container_width=True, type="primary")
 
-    if not run:
+    # Streamlit ejecuta de nuevo todo el script cuando se mueve un slider/selectbox.
+    # Por eso los resultados del análisis se guardan en session_state. Así el usuario
+    # puede mover el visualizador 2D/3D sin tener que volver a cargar y calcular.
+    if run:
+        if force_file is None:
+            st.error("Debes cargar el archivo de fuerza para continuar.")
+            return
+
+        try:
+            force_bytes = force_file.read()
+            raw_force, plates, parse_warnings = parse_force_general(force_bytes)
+            f, plates, sig_warnings = prepare_force_signals(
+                raw_force, plates,
+                fs_force=float(fs_force), fs_traj=float(fs_traj),
+                threshold=float(threshold), cutoff=float(cutoff), apply_filter=bool(apply_filter),
+            )
+            events, blocks, contact_mask, event_warnings = detect_jump_events(
+                f, plates, fs_force=float(fs_force), threshold=float(threshold),
+                min_contact_ms=float(min_contact_ms), min_flight_ms=float(min_flight_ms), max_gap_ms=20,
+            )
+        except Exception as e:
+            st.error(f"Error procesando fuerza: {e}")
+            st.exception(e)
+            return
+
+        all_warnings = parse_warnings + sig_warnings + event_warnings
+
+        if not events:
+            st.session_state["analysis_payload"] = None
+            section("Control de calidad")
+            for w in all_warnings:
+                info_box(w, "warn")
+            st.plotly_chart(
+                go.Figure(go.Scatter(x=f.get("time", np.arange(len(f))), y=f.get("GRF_z", np.zeros(len(f))), name="GRF_z")),
+                use_container_width=True,
+                key="qc_no_events_grf",
+            )
+            st.dataframe(pd.DataFrame([b.__dict__ for b in blocks]), use_container_width=True)
+            return
+
+        if len(events) > 1:
+            labels = [
+                f"Evento {i+1}: vuelo {ev.flight_time_s*1000:.1f} ms | contacto {ev.pre_contact.active_plates} → {ev.landing_contact.active_plates}"
+                for i, ev in enumerate(events)
+            ]
+            selected_label = st.selectbox(
+                "Se detectaron varios eventos. Selecciona el salto a analizar:",
+                labels,
+                index=int(np.argmax([ev.flight_time_s for ev in events])),
+            )
+            event = events[labels.index(selected_label)]
+        else:
+            event = events[0]
+
+        res = compute_force_metrics(
+            f, plates, event, blocks,
+            fs_force=float(fs_force), threshold=float(threshold),
+            mass_override=mass_input if mass_input > 0 else None,
+        )
+        all_warnings.extend(res.get("warnings", []))
+
+        traj_clean = None
+        angles_df = None
+        marker_qdf = pd.DataFrame()
+        kine_qc_rows: List[Dict] = []
+        if traj_file is not None:
+            try:
+                traj_bytes = traj_file.read()
+                raw_traj, traj_warnings = parse_traj_general(traj_bytes)
+                traj_clean, marker_qdf, clean_warnings = clean_trajectory(
+                    raw_traj, fs_traj=float(fs_traj),
+                    first_force_frame=safe_float(raw_force["Frame"].iloc[0]),
+                    max_interp_gap=int(max_interp_gap), treat_zero_as_missing=bool(treat_zero),
+                )
+                traj_clean, angles_df, kine_qc_rows, kin_warnings = compute_kinematics(traj_clean, marker_qdf)
+                all_warnings.extend(traj_warnings + clean_warnings + kin_warnings)
+            except Exception as e:
+                all_warnings.append(f"No se pudo procesar trayectoria: {e}")
+
+        st.session_state["analysis_payload"] = {
+            "f": f,
+            "plates": plates,
+            "blocks": blocks,
+            "res": res,
+            "all_warnings": all_warnings,
+            "traj_clean": traj_clean,
+            "angles_df": angles_df,
+            "marker_qdf": marker_qdf,
+            "kine_qc_rows": kine_qc_rows,
+        }
+
+    elif "analysis_payload" not in st.session_state or st.session_state.get("analysis_payload") is None:
         info_box(
-            "Sube al menos el archivo de fuerza.",
+            "Sube al menos el archivo de fuerza y presiona CALCULAR ANÁLISIS.",
             "info",
         )
         return
 
-    if force_file is None:
-        st.error("Debes cargar el archivo de fuerza para continuar.")
-        return
-
-    try:
-        force_bytes = force_file.read()
-        raw_force, plates, parse_warnings = parse_force_general(force_bytes)
-        f, plates, sig_warnings = prepare_force_signals(
-            raw_force, plates,
-            fs_force=float(fs_force), fs_traj=float(fs_traj),
-            threshold=float(threshold), cutoff=float(cutoff), apply_filter=bool(apply_filter),
-        )
-        events, blocks, contact_mask, event_warnings = detect_jump_events(
-            f, plates, fs_force=float(fs_force), threshold=float(threshold),
-            min_contact_ms=float(min_contact_ms), min_flight_ms=float(min_flight_ms), max_gap_ms=20,
-        )
-    except Exception as e:
-        st.error(f"Error procesando fuerza: {e}")
-        st.exception(e)
-        return
-
-    all_warnings = parse_warnings + sig_warnings + event_warnings
-
-    if not events:
-        section("Control de calidad")
-        for w in all_warnings:
-            info_box(w, "warn")
-        st.plotly_chart(go.Figure(go.Scatter(x=f.get("time", np.arange(len(f))), y=f.get("GRF_z", np.zeros(len(f))), name="GRF_z")), use_container_width=True, key="qc_no_events_grf")
-        st.dataframe(pd.DataFrame([b.__dict__ for b in blocks]), use_container_width=True)
-        return
-
-    # Selección de evento si hay varios saltos
-    if len(events) > 1:
-        labels = [f"Evento {i+1}: vuelo {ev.flight_time_s*1000:.1f} ms | contacto {ev.pre_contact.active_plates} → {ev.landing_contact.active_plates}" for i, ev in enumerate(events)]
-        selected_label = st.selectbox("Se detectaron varios eventos. Selecciona el salto a analizar:", labels, index=int(np.argmax([ev.flight_time_s for ev in events])))
-        event = events[labels.index(selected_label)]
-    else:
-        event = events[0]
-
-    res = compute_force_metrics(
-        f, plates, event, blocks,
-        fs_force=float(fs_force), threshold=float(threshold),
-        mass_override=mass_input if mass_input > 0 else None,
-    )
-    all_warnings.extend(res.get("warnings", []))
-
-    traj_clean = None
-    angles_df = None
-    marker_qdf = pd.DataFrame()
-    kine_qc_rows: List[Dict] = []
-    if traj_file is not None:
-        try:
-            traj_bytes = traj_file.read()
-            raw_traj, traj_warnings = parse_traj_general(traj_bytes)
-            traj_clean, marker_qdf, clean_warnings = clean_trajectory(
-                raw_traj, fs_traj=float(fs_traj),
-                first_force_frame=safe_float(raw_force["Frame"].iloc[0]),
-                max_interp_gap=int(max_interp_gap), treat_zero_as_missing=bool(treat_zero),
-            )
-            traj_clean, angles_df, kine_qc_rows, kin_warnings = compute_kinematics(traj_clean, marker_qdf)
-            all_warnings.extend(traj_warnings + clean_warnings + kin_warnings)
-        except Exception as e:
-            all_warnings.append(f"No se pudo procesar trayectoria: {e}")
+    payload = st.session_state["analysis_payload"]
+    f = payload["f"]
+    plates = payload["plates"]
+    blocks = payload["blocks"]
+    res = payload["res"]
+    all_warnings = payload["all_warnings"]
+    traj_clean = payload["traj_clean"]
+    angles_df = payload["angles_df"]
+    marker_qdf = payload["marker_qdf"]
+    kine_qc_rows = payload["kine_qc_rows"]
 
     # Tabs
     tabs = st.tabs(["📊 Resumen", "✅ Control de calidad", "⚡ Fuerzas", "🦵 Cinemática", "📋 Datos"])
@@ -1156,19 +1681,148 @@ def main():
         if traj_clean is None or angles_df is None:
             info_box("No se cargó trayectoria o no pudo procesarse. El análisis de fuerza sigue siendo válido.", "warn")
         else:
-            col1, col2 = st.columns(2)
-            with col1:
-                fig_l = plot_angles(angles_df, "L")
-                if fig_l is not None:
-                    st.plotly_chart(fig_l, use_container_width=True, key="kinematics_angles_left")
+            section("Ángulos articulares")
+            
+
+            angle_tabs = st.tabs(["Ángulo interno geométrico", "Referencia de flexión/extensión"])
+            with angle_tabs[0]:
+                info_box(
+                    "Lectura: se mantiene el cálculo original entre tres marcadores. En la rodilla, valores altos indican mayor apertura del segmento; "
+                    "valores bajos indican mayor flexión. No se marca 180° como regla absoluta porque los marcadores reales, el plano de captura y el gesto pueden variar.",
+                    "info",
+                )
+                col1, col2 = st.columns(2)
+                with col1:
+                    fig_l = plot_angles(angles_df, "L")
+                    if fig_l is not None:
+                        st.plotly_chart(fig_l, use_container_width=True, key="kinematics_angles_left_internal")
+                    else:
+                        info_box("No hay ángulos izquierdos válidos.", "warn")
+                with col2:
+                    fig_r = plot_angles(angles_df, "R")
+                    if fig_r is not None:
+                        st.plotly_chart(fig_r, use_container_width=True, key="kinematics_angles_right_internal")
+                    else:
+                        info_box("No hay ángulos derechos válidos.", "warn")
+
+            with angle_tabs[1]:
+                info_box(
+                    "Lectura: se usa 180° − ángulo interno. Así, 0° representa una postura cercana a la extensión y "
+                    "valores mayores representan mayor flexión aproximada. Es especialmente útil para rodilla; en cadera y tobillo debe usarse como referencia visual junto con el ángulo interno.",
+                    "warn",
+                )
+                col1, col2 = st.columns(2)
+                with col1:
+                    fig_l = plot_angles_flexion(angles_df, "L")
+                    if fig_l is not None:
+                        st.plotly_chart(fig_l, use_container_width=True, key="kinematics_angles_left_flexion")
+                    else:
+                        info_box("No hay flexión/extensión izquierda válida.", "warn")
+                with col2:
+                    fig_r = plot_angles_flexion(angles_df, "R")
+                    if fig_r is not None:
+                        st.plotly_chart(fig_r, use_container_width=True, key="kinematics_angles_right_flexion")
+                    else:
+                        info_box("No hay flexión/extensión derecha válida.", "warn")
+
+            section("Visualizador interactivo del movimiento registrado")
+            
+
+            viewer_control = st.radio(
+                "Tipo de control del visualizador",
+                ["Video / reproducción continua", "Frame manual"],
+                horizontal=True,
+                key="viewer_control_type",
+            )
+
+            vcols = st.columns([1, 1, 1])
+            with vcols[0]:
+                viewer_mode = st.selectbox("Vista", ["2D", "3D"], index=0, key="viewer_mode")
+            with vcols[1]:
+                viewer_side = st.selectbox("Segmentos", ["Ambos", "Izquierdo", "Derecho"], index=0, key="viewer_side")
+            with vcols[2]:
+                plane = st.selectbox(
+                    "Plano 2D",
+                    ["X-Z", "Y-Z", "X-Y"],
+                    index=0,
+                    key="viewer_plane",
+                    help="X-Z o Y-Z suelen ser las mejores vistas laterales; depende del sistema de coordenadas Vicon usado.",
+                    disabled=(viewer_mode != "2D"),
+                )
+
+            opt_cols = st.columns([1, 1, 1])
+            with opt_cols[0]:
+                center_pelvis = st.checkbox(
+                    "Centrar en pelvis",
+                    value=True,
+                    key="viewer_center_pelvis",
+                    help="Recomendado para fisioterapia: evita que el esqueleto se desplace fuera de la gráfica y facilita ver la postura.",
+                )
+            with opt_cols[1]:
+                show_labels = st.checkbox("Mostrar nombres", value=False, key="viewer_show_labels")
+            with opt_cols[2]:
+                frame_duration_ms = st.slider(
+                    "Velocidad del video (ms/frame)",
+                    min_value=20, max_value=200, value=60, step=10,
+                    key="viewer_frame_duration_ms",
+                )
+
+            # Muestreo automático de frames para mantener fluida la app en la nube sin mostrar controles técnicos al usuario.
+            frame_stride = 1 if len(traj_clean) <= 250 else (2 if len(traj_clean) <= 600 else 3)
+
+            if viewer_control == "Video / reproducción continua":
+                if viewer_mode == "2D":
+                    fig_skel = plot_skeleton_2d_animation(
+                        traj_clean, angles_df, plane=plane, side=viewer_side,
+                        center_on_pelvis=center_pelvis, show_labels=show_labels,
+                        stride=int(frame_stride), frame_duration_ms=int(frame_duration_ms),
+                    )
                 else:
-                    info_box("No hay ángulos izquierdos válidos.", "warn")
-            with col2:
-                fig_r = plot_angles(angles_df, "R")
-                if fig_r is not None:
-                    st.plotly_chart(fig_r, use_container_width=True, key="kinematics_angles_right")
+                    fig_skel = plot_skeleton_3d_animation(
+                        traj_clean, angles_df, side=viewer_side,
+                        center_on_pelvis=center_pelvis, show_labels=show_labels,
+                        stride=int(frame_stride), frame_duration_ms=int(frame_duration_ms),
+                    )
+
+                if fig_skel is not None:
+                    st.plotly_chart(
+                        fig_skel,
+                        use_container_width=True,
+                        key="kinematics_skeleton_video",
+                        config={"displayModeBar": True, "scrollZoom": True},
+                    )
+                    info_box(
+                        "Usa el botón ▶ para reproducir o ⏸ para pausar. También puedes mover el control inferior de la gráfica para revisar un instante específico.",
+                        "info",
+                    )
                 else:
-                    info_box("No hay ángulos derechos válidos.", "warn")
+                    info_box("No se pudo generar el video del exoesqueleto. Revise que existan los marcadores necesarios.", "warn")
+            else:
+                frame_idx = st.slider(
+                    "Frame / instante del movimiento",
+                    min_value=0, max_value=max(len(traj_clean) - 1, 0),
+                    value=0, step=1,
+                    key="viewer_frame_idx",
+                )
+                if viewer_mode == "2D":
+                    fig_skel = plot_skeleton_2d(
+                        traj_clean, frame_idx, plane=plane, side=viewer_side,
+                        center_on_pelvis=center_pelvis, show_labels=show_labels,
+                    )
+                else:
+                    fig_skel = plot_skeleton_3d(
+                        traj_clean, frame_idx, side=viewer_side,
+                        center_on_pelvis=center_pelvis, show_labels=show_labels,
+                    )
+
+                if fig_skel is not None:
+                    st.plotly_chart(fig_skel, use_container_width=True, key="kinematics_skeleton_manual")
+                else:
+                    info_box("No se pudo dibujar el exoesqueleto. Revise que existan marcadores LASI/RASI, LTHI/RTHI, LKNE/RKNE, LANK/RANK y LTOE/RTOE.", "warn")
+
+                st.dataframe(current_angles_table(angles_df, frame_idx).round(2), use_container_width=True, hide_index=True)
+
+            section("Trayectoria vertical del Centro de Masa/Pelvis")
             fig_com = plot_com(traj_clean, res)
             if fig_com is not None:
                 st.plotly_chart(fig_com, use_container_width=True, key="kinematics_com")
@@ -1181,7 +1835,17 @@ def main():
             for col, label in names.items():
                 if col in angles_df.columns and angles_df[col].notna().any():
                     v = angles_df[col].dropna()
-                    rows.append({"Variable": label, "Mín (°)": v.min(), "Máx (°)": v.max(), "Media (°)": v.mean(), "Rango (°)": v.max() - v.min()})
+                    flex_col = f"{col}_flexion"
+                    flex = angles_df[flex_col].dropna() if flex_col in angles_df.columns else pd.Series(dtype=float)
+                    rows.append({
+                        "Variable": label,
+                        "Mín interno (°)": v.min(),
+                        "Máx interno (°)": v.max(),
+                        "Media interna (°)": v.mean(),
+                        "Rango interno (°)": v.max() - v.min(),
+                        "Flexión máx. estimada (°)": flex.max() if not flex.empty else np.nan,
+                        "Flexión media estimada (°)": flex.mean() if not flex.empty else np.nan,
+                    })
             st.dataframe(pd.DataFrame(rows).round(2), use_container_width=True, hide_index=True)
 
     with tabs[4]:
