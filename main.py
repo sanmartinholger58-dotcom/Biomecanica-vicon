@@ -800,14 +800,34 @@ def compute_kinematics(traj: pd.DataFrame, qdf: pd.DataFrame) -> Tuple[pd.DataFr
         warnings.append("No se encontraron LASI y RASI completos para estimar el CoM/pelvis.")
 
     # Ángulos por marcadores disponibles.
+    # La función vec_angle(A, B, C) calcula el ángulo en B.
+
+    def marker_available(df, marker):
+        return all(f"{marker}_{ax}" in df.columns for ax in ["X", "Y", "Z"])
+
+    def choose_marker(df, preferred, fallback):
+        return preferred if marker_available(df, preferred) else fallback
+
+    LTIB_KNEE_REF = choose_marker(out, "LTIB", "LANK")
+    RTIB_KNEE_REF = choose_marker(out, "RTIB", "RANK")
+
+    LTIB_ANKLE_REF = choose_marker(out, "LTIB", "LKNE")
+    RTIB_ANKLE_REF = choose_marker(out, "RTIB", "RKNE")
+
     angle_specs = {
-        "knee_L": ("LTHI", "LKNE", "LANK"),
-        "knee_R": ("RTHI", "RKNE", "RANK"),
-        "hip_L": ("LASI", "LTHI", "LKNE"),
-        "hip_R": ("RASI", "RTHI", "RKNE"),
-        "ankle_L": ("LKNE", "LANK", "LTOE"),
-        "ankle_R": ("RKNE", "RANK", "RTOE"),
+
+        "hip_L": ("RASI", "LASI", "LTHI"),
+        "hip_R": ("LASI", "RASI", "RTHI"),
+
+
+        "knee_L": ("LTHI", "LKNE", LTIB_KNEE_REF),
+        "knee_R": ("RTHI", "RKNE", RTIB_KNEE_REF),
+
+
+        "ankle_L": (LTIB_ANKLE_REF, "LANK", "LTOE"),
+        "ankle_R": (RTIB_ANKLE_REF, "RANK", "RTOE"),
     }
+
     angles = pd.DataFrame({"Frame": out["Frame"], "time": out["time"]})
     qc_rows: List[Dict] = [{"Elemento": "Centro de masa/pelvis", "Estado": com_status, "Detalle": f"Validez {com_valid:.1f}%"}]
 
@@ -824,12 +844,25 @@ def compute_kinematics(traj: pd.DataFrame, qdf: pd.DataFrame) -> Tuple[pd.DataFr
             C = [row[f"{C_m}_X"], row[f"{C_m}_Y"], row[f"{C_m}_Z"]]
             vals.append(vec_angle(A, B, C))
         angles[name] = vals
-        # Referencia de flexión/extensión estimada:
-        # El ángulo calculado es interno geométrico. Para facilitar la lectura clínica,
-        # se agrega una referencia donde 0° ≈ extensión y valores mayores ≈ mayor flexión.
-        # Esta conversión es especialmente directa para rodilla; en cadera/tobillo se usa
-        # como ayuda visual y debe interpretarse junto con el ángulo interno original.
-        angles[f"{name}_flexion"] = np.clip(180.0 - pd.Series(vals, dtype=float), 0, 180)
+
+        # Movimiento angular relativo estimado:
+        # Rodilla: 180°.
+        # Cadera y tobillo: por la definición geométrica usada, referencia neutra aproximada en 90°.
+        def relative_joint_motion(joint_name: str, angle_value: float) -> float:
+            if not np.isfinite(angle_value):
+                return np.nan
+            if joint_name.startswith("knee"):
+                return float(np.clip(180.0 - angle_value, 0, 180))
+            
+            
+            if joint_name.startswith("hip") or joint_name.startswith("ankle"):
+                return float(np.clip(abs(90.0 - angle_value), 0, 180))
+            return np.nan
+
+        angles[f"{name}_flexion"] = pd.Series(
+            [relative_joint_motion(name, v) for v in vals],
+            dtype=float,
+        )
         valid_pct = float(pd.Series(vals).notna().mean() * 100)
         # Filtro para cambios irreales: grandes saltos de un frame a otro.
         jumps = pd.Series(vals).diff().abs()
@@ -939,7 +972,7 @@ def plot_angles(angles: pd.DataFrame, side: str) -> Optional[go.Figure]:
 
 
 def plot_angles_flexion(angles: pd.DataFrame, side: str) -> Optional[go.Figure]:
-    """Muestra una referencia clínica simplificada: mayor valor = mayor flexión."""
+    """Muestra una referencia clínica simplificada: mayor valor = mayor movimiento angular relativo."""
     if angles is None or angles.empty:
         return None
     fig = go.Figure()
@@ -954,11 +987,11 @@ def plot_angles_flexion(angles: pd.DataFrame, side: str) -> Optional[go.Figure]:
             ))
     if len(fig.data) == 0:
         return None
-    fig.update_layout(**base_layout(f"Flexión/extensión estimada - {'Izquierdo' if side == 'L' else 'Derecho'}", 350))
+    fig.update_layout(**base_layout(f"Movimiento angular relativo estimado - {'Izquierdo' if side == 'L' else 'Derecho'}", 350))
     fig.update_xaxes(title_text="Tiempo (s)")
-    fig.update_yaxes(title_text="Referencia de flexión (°) | 0° ≈ postura extendida")
+    fig.update_yaxes(title_text="Movimiento angular relativo (°) | 0° ≈ alineación extendida")
     fig.add_hline(y=0, line_dash="dot", line_color=COLORS["secondary"], opacity=0.6,
-                  annotation_text="0° ≈ extensión", annotation_font_color=COLORS["secondary"])
+                  annotation_text="0° ≈ alineación extendida", annotation_font_color=COLORS["secondary"])
     return fig
 
 
@@ -1281,7 +1314,7 @@ def plot_skeleton_2d_animation(
         summary = angle_summary_for_frame(angles, idx, side)
         title = f"Video 2D del movimiento | Frame {int(row['Frame'])} | t = {t:.3f} s"
         if summary:
-            title += f"<br><sup>Flexión/extensión estimada: {summary}</sup>"
+            title += f"<br><sup>Movimiento angular relativo estimado: {summary}</sup>"
         frame_name = str(idx)
         frames.append(go.Frame(
             name=frame_name,
@@ -1351,7 +1384,7 @@ def plot_skeleton_3d_animation(
         summary = angle_summary_for_frame(angles, idx, side)
         title = f"Video 3D del movimiento | Frame {int(row['Frame'])} | t = {t:.3f} s"
         if summary:
-            title += f"<br><sup>Flexión/extensión estimada: {summary}</sup>"
+            title += f"<br><sup>Movimiento angular relativo estimado: {summary}</sup>"
         frame_name = str(idx)
         frames.append(go.Frame(
             name=frame_name,
@@ -1408,11 +1441,11 @@ def current_angles_table(angles: pd.DataFrame, idx: int) -> pd.DataFrame:
             rows.append({
                 "Articulación": label,
                 "Ángulo interno (°)": internal if np.isfinite(internal) else np.nan,
-                "Flexión/extensión estimada (°)": flexion if np.isfinite(flexion) else np.nan,
+                "Movimiento angular relativo estimado (°)": flexion if np.isfinite(flexion) else np.nan,
                 "Lectura rápida": (
-                    "posición más extendida" if np.isfinite(flexion) and flexion <= 20 else
-                    "flexión moderada/alta" if np.isfinite(flexion) and flexion >= 45 else
-                    "flexión baja/moderada" if np.isfinite(flexion) else "—"
+                    "alineación más extendida" if np.isfinite(flexion) and flexion <= 20 else
+                    "movimiento relativo alto" if np.isfinite(flexion) and flexion >= 45 else
+                    "movimiento relativo bajo/moderado" if np.isfinite(flexion) else "—"
                 ),
             })
     return pd.DataFrame(rows)
@@ -1684,11 +1717,11 @@ def main():
             section("Ángulos articulares")
             
 
-            angle_tabs = st.tabs(["Ángulo interno geométrico", "Referencia de flexión/extensión"])
+            angle_tabs = st.tabs(["Ángulo interno geométrico", "Movimiento angular relativo"])
             with angle_tabs[0]:
                 info_box(
                     "Lectura: se mantiene el cálculo original entre tres marcadores. En la rodilla, valores altos indican mayor apertura del segmento; "
-                    "valores bajos indican mayor flexión. No se marca 180° como regla absoluta porque los marcadores reales, el plano de captura y el gesto pueden variar.",
+                    "valores bajos indican mayor cierre angular del segmento. No se marca 180° como regla absoluta porque los marcadores reales, el plano de captura y el gesto pueden variar.",
                     "info",
                 )
                 col1, col2 = st.columns(2)
@@ -1707,8 +1740,8 @@ def main():
 
             with angle_tabs[1]:
                 info_box(
-                    "Lectura: se usa 180° − ángulo interno. Así, 0° representa una postura cercana a la extensión y "
-                    "valores mayores representan mayor flexión aproximada. Es especialmente útil para rodilla; en cadera y tobillo debe usarse como referencia visual junto con el ángulo interno.",
+                    "Lectura: se usa 180° − ángulo interno. Así, 0° representa una alineación cercana a la extensión y "
+                    "valores mayores representan mayor movimiento angular relativo. Es una referencia visual que debe interpretarse junto con el ángulo interno geométrico.",
                     "warn",
                 )
                 col1, col2 = st.columns(2)
@@ -1717,13 +1750,13 @@ def main():
                     if fig_l is not None:
                         st.plotly_chart(fig_l, use_container_width=True, key="kinematics_angles_left_flexion")
                     else:
-                        info_box("No hay flexión/extensión izquierda válida.", "warn")
+                        info_box("No hay movimiento angular relativo izquierdo válido.", "warn")
                 with col2:
                     fig_r = plot_angles_flexion(angles_df, "R")
                     if fig_r is not None:
                         st.plotly_chart(fig_r, use_container_width=True, key="kinematics_angles_right_flexion")
                     else:
-                        info_box("No hay flexión/extensión derecha válida.", "warn")
+                        info_box("No hay movimiento angular relativo derecho válido.", "warn")
 
             section("Visualizador interactivo del movimiento registrado")
             
@@ -1843,8 +1876,8 @@ def main():
                         "Máx interno (°)": v.max(),
                         "Media interna (°)": v.mean(),
                         "Rango interno (°)": v.max() - v.min(),
-                        "Flexión máx. estimada (°)": flex.max() if not flex.empty else np.nan,
-                        "Flexión media estimada (°)": flex.mean() if not flex.empty else np.nan,
+                        "Movimiento relativo máx. (°)": flex.max() if not flex.empty else np.nan,
+                        "Movimiento relativo medio (°)": flex.mean() if not flex.empty else np.nan,
                     })
             st.dataframe(pd.DataFrame(rows).round(2), use_container_width=True, hide_index=True)
 
