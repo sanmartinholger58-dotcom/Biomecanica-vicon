@@ -960,14 +960,14 @@ def plot_angles(angles: pd.DataFrame, side: str) -> Optional[go.Figure]:
     fig = go.Figure()
     labels = {"knee": "Rodilla", "hip": "Cadera", "ankle": "Tobillo"}
     for joint, name in labels.items():
-        col = f"{joint}_{side}"
+        col = f"{joint}_{side}_flexion"
         if col in angles.columns and angles[col].notna().any():
             fig.add_trace(go.Scatter(x=angles["time"], y=angles[col], name=f"{name} ({'Izq.' if side == 'L' else 'Der.'})", line=dict(width=2)))
     if len(fig.data) == 0:
         return None
-    fig.update_layout(**base_layout(f"Ángulos internos geométricos - {'Izquierdo' if side == 'L' else 'Derecho'}", 350))
+    fig.update_layout(**base_layout(f"Movimiento angular relativo estimado - {'Izquierdo' if side == 'L' else 'Derecho'}", 350))
     fig.update_xaxes(title_text="Tiempo (s)")
-    fig.update_yaxes(title_text="Ángulo interno (°)")
+    fig.update_yaxes(title_text="Movimiento angular relativo (°)")
     return fig
 
 
@@ -1717,36 +1717,19 @@ def main():
             section("Ángulos articulares")
             
 
-            angle_tabs = st.tabs(["Ángulo interno geométrico", "Movimiento angular relativo"])
-            with angle_tabs[0]:
-                col1, col2 = st.columns(2)
-                with col1:
-                    fig_l = plot_angles(angles_df, "L")
-                    if fig_l is not None:
-                        st.plotly_chart(fig_l, use_container_width=True, key="kinematics_angles_left_internal")
-                    else:
-                        info_box("No hay ángulos izquierdos válidos.", "warn")
-                with col2:
-                    fig_r = plot_angles(angles_df, "R")
-                    if fig_r is not None:
-                        st.plotly_chart(fig_r, use_container_width=True, key="kinematics_angles_right_internal")
-                    else:
-                        info_box("No hay ángulos derechos válidos.", "warn")
-
-            with angle_tabs[1]:
-                col1, col2 = st.columns(2)
-                with col1:
-                    fig_l = plot_angles_flexion(angles_df, "L")
-                    if fig_l is not None:
-                        st.plotly_chart(fig_l, use_container_width=True, key="kinematics_angles_left_flexion")
-                    else:
-                        info_box("No hay movimiento angular relativo izquierdo válido.", "warn")
-                with col2:
-                    fig_r = plot_angles_flexion(angles_df, "R")
-                    if fig_r is not None:
-                        st.plotly_chart(fig_r, use_container_width=True, key="kinematics_angles_right_flexion")
-                    else:
-                        info_box("No hay movimiento angular relativo derecho válido.", "warn")
+            col1, col2 = st.columns(2)
+            with col1:
+                fig_l = plot_angles(angles_df, "L")
+                if fig_l is not None:
+                    st.plotly_chart(fig_l, use_container_width=True, key="kinematics_angles_left_relative")
+                else:
+                    info_box("No hay ángulos izquierdos válidos.", "warn")
+            with col2:
+                fig_r = plot_angles(angles_df, "R")
+                if fig_r is not None:
+                    st.plotly_chart(fig_r, use_container_width=True, key="kinematics_angles_right_relative")
+                else:
+                    info_box("No hay ángulos derechos válidos.", "warn")
 
             section("Visualizador interactivo del movimiento registrado")
             
