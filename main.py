@@ -1719,11 +1719,6 @@ def main():
 
             angle_tabs = st.tabs(["Ángulo interno geométrico", "Movimiento angular relativo"])
             with angle_tabs[0]:
-                info_box(
-                    "Lectura: se mantiene el cálculo original entre tres marcadores. En la rodilla, valores altos indican mayor apertura del segmento; "
-                    "valores bajos indican mayor cierre angular del segmento. No se marca 180° como regla absoluta porque los marcadores reales, el plano de captura y el gesto pueden variar.",
-                    "info",
-                )
                 col1, col2 = st.columns(2)
                 with col1:
                     fig_l = plot_angles(angles_df, "L")
