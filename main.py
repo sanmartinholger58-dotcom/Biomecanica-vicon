@@ -2241,7 +2241,7 @@ def main():
                     })
             st.dataframe(pd.DataFrame(rows).round(2), use_container_width=True, hide_index=True)
 
-         section("Evaluación clínica por tipo de salto")
+            section("Evaluación clínica por tipo de salto")
 
             eval_cols = st.columns([1, 1])
             with eval_cols[0]:
