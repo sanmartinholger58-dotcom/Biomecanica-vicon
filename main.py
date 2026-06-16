@@ -989,7 +989,7 @@ def plot_angles_flexion(angles: pd.DataFrame, side: str) -> Optional[go.Figure]:
         return None
     fig.update_layout(**base_layout(f"Movimiento angular relativo estimado - {'Izquierdo' if side == 'L' else 'Derecho'}", 350))
     fig.update_xaxes(title_text="Tiempo (s)")
-    fig.update_yaxes(title_text="Movimiento angular relativo (°) | 0° ≈ alineación extendida")
+    fig.update_yaxes(title_text="Movimiento angular relativo (°) ")
     fig.add_hline(y=0, line_dash="dot", line_color=COLORS["secondary"], opacity=0.6,
                   annotation_text="0° ≈ alineación extendida", annotation_font_color=COLORS["secondary"])
     return fig
