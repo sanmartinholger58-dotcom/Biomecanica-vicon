@@ -1450,6 +1450,393 @@ def current_angles_table(angles: pd.DataFrame, idx: int) -> pd.DataFrame:
             })
     return pd.DataFrame(rows)
 
+# =============================================================================
+# Evaluación clínica por tipo de salto
+# =============================================================================
+
+def normalize_vec(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=float)
+    n = np.linalg.norm(v)
+    if not np.isfinite(n) or n < 1e-9:
+        return np.full(3, np.nan)
+    return v / n
+
+
+def point_marker(row: pd.Series, marker: str) -> Optional[np.ndarray]:
+    cols = [f"{marker}_X", f"{marker}_Y", f"{marker}_Z"]
+    if not all(c in row.index for c in cols):
+        return None
+    p = np.array([safe_float(row[cols[0]]), safe_float(row[cols[1]]), safe_float(row[cols[2]])], dtype=float)
+    if np.any(~np.isfinite(p)):
+        return None
+    return p
+
+
+def global_axis(axis_name: str = "Z") -> np.ndarray:
+    axis_name = str(axis_name).upper()
+    if axis_name == "X":
+        return np.array([1.0, 0.0, 0.0])
+    if axis_name == "Y":
+        return np.array([0.0, 1.0, 0.0])
+    return np.array([0.0, 0.0, 1.0])
+
+
+def pelvis_axes(row: pd.Series, vertical_axis: str = "Z", invert_anterior: bool = False) -> Tuple[Optional[Dict[str, np.ndarray]], str]:
+    """
+    Construye ejes locales de pelvis.
+
+    Ejes:
+    - R: derecha anatómica
+    - A: anterior anatómico aproximado
+    - U: vertical/superior
+
+    Si existen LPSI/RPSI o SACR, se usan para orientar el eje anterior.
+    Si no existen, se usa LASI/RASI + eje vertical global.
+    """
+    lasi = point_marker(row, "LASI")
+    rasi = point_marker(row, "RASI")
+
+    if lasi is None or rasi is None:
+        return None, "NO VÁLIDO: faltan LASI/RASI"
+
+    asi_center = (lasi + rasi) / 2.0
+
+    # Eje derecha anatómica: desde LASI hacia RASI
+    u_right = normalize_vec(rasi - lasi)
+    if np.any(~np.isfinite(u_right)):
+        return None, "NO VÁLIDO: eje lateral pelvis no válido"
+
+    g_up = global_axis(vertical_axis)
+
+    # Buscar marcador posterior de pelvis
+    lpsi = point_marker(row, "LPSI")
+    rpsi = point_marker(row, "RPSI")
+    sacr = point_marker(row, "SACR")
+
+    posterior_center = None
+    source = "LASI/RASI + eje vertical global"
+
+    if lpsi is not None and rpsi is not None:
+        posterior_center = (lpsi + rpsi) / 2.0
+        source = "LASI/RASI + LPSI/RPSI"
+    elif sacr is not None:
+        posterior_center = sacr
+        source = "LASI/RASI + SACR"
+
+    if posterior_center is not None:
+        # Anterior anatómico: desde pelvis posterior hacia ASIS
+        u_anterior = normalize_vec(asi_center - posterior_center)
+
+        # Superior: producto cruzado derecha x anterior
+        u_up = normalize_vec(np.cross(u_right, u_anterior))
+
+        # Asegurar que el eje superior apunte aproximadamente hacia Z positiva
+        if np.isfinite(np.dot(u_up, g_up)) and np.dot(u_up, g_up) < 0:
+            u_up = -u_up
+
+        # Recalcular anterior para mantener sistema ortonormal
+        u_anterior = normalize_vec(np.cross(u_up, u_right))
+
+    else:
+        # Sin marcadores posteriores: se aproxima con eje vertical global
+        # Se remueve cualquier componente de vertical que coincida con el eje lateral
+        u_up = normalize_vec(g_up - np.dot(g_up, u_right) * u_right)
+
+        # En un sistema derecho-anterior-superior:
+        # anterior = superior x derecha
+        u_anterior = normalize_vec(np.cross(u_up, u_right))
+
+    if invert_anterior:
+        u_anterior = -u_anterior
+
+    if np.any(~np.isfinite(u_anterior)) or np.any(~np.isfinite(u_up)):
+        return None, "NO VÁLIDO: no se pudieron construir ejes de pelvis"
+
+    return {"R": u_right, "A": u_anterior, "U": u_up}, source
+
+
+def signed_angle_from_components(primary_component: float, reference_component: float) -> float:
+    """
+    Devuelve ángulo firmado en grados usando atan2.
+    Se usa para obtener dirección clínica del movimiento.
+    """
+    if not np.isfinite(primary_component) or not np.isfinite(reference_component):
+        return np.nan
+    return float(np.degrees(np.arctan2(primary_component, reference_component)))
+
+
+def clinical_angles_for_row(
+    row: pd.Series,
+    side: str,
+    axes: Dict[str, np.ndarray],
+) -> Dict[str, float]:
+    """
+    Calcula ángulos clínicos por lado.
+
+    Convenciones:
+    - Cadera flex/ext: flexión positiva, extensión negativa.
+    - Cadera abd/add: abducción positiva, aducción negativa.
+    - Rodilla: flexión positiva, extensión cercana a 0°.
+    - Tobillo: dorsiflexión positiva, plantiflexión negativa.
+    """
+    side = side.upper()
+
+    if side == "L":
+        hip_marker = "LASI"
+        knee_marker = "LKNE"
+        ankle_marker = "LANK"
+        toe_marker = "LTOE"
+        outward = -axes["R"]   # izquierda anatómica
+    else:
+        hip_marker = "RASI"
+        knee_marker = "RKNE"
+        ankle_marker = "RANK"
+        toe_marker = "RTOE"
+        outward = axes["R"]    # derecha anatómica
+
+    hip = point_marker(row, hip_marker)
+    knee = point_marker(row, knee_marker)
+    ankle = point_marker(row, ankle_marker)
+    toe = point_marker(row, toe_marker)
+
+    result = {
+        f"hip_{side}_flex_ext": np.nan,
+        f"hip_{side}_abd_add": np.nan,
+        f"knee_{side}_flex": np.nan,
+        f"ankle_{side}_dorsi_plantar": np.nan,
+    }
+
+    if hip is None or knee is None:
+        return result
+
+    # Vector muslo: cadera -> rodilla
+    thigh = normalize_vec(knee - hip)
+
+    # Cadera flexión/extensión:
+    # Se analiza en plano sagital de pelvis.
+    # Componente anterior positiva = flexión.
+    # Componente posterior negativa = extensión.
+    result[f"hip_{side}_flex_ext"] = signed_angle_from_components(
+        np.dot(thigh, axes["A"]),
+        np.dot(thigh, -axes["U"])
+    )
+
+    # Cadera abducción/aducción:
+    # Se analiza en plano frontal.
+    # Componente hacia afuera positiva = abducción.
+    # Componente hacia adentro negativa = aducción.
+    result[f"hip_{side}_abd_add"] = signed_angle_from_components(
+        np.dot(thigh, outward),
+        np.dot(thigh, -axes["U"])
+    )
+
+    if ankle is not None:
+        # Rodilla:
+        # Ángulo interno entre cadera-rodilla-tobillo.
+        # Rodilla extendida ≈ 180°, por eso flexión = 180 - ángulo interno.
+        knee_internal = vec_angle(hip, knee, ankle)
+        if np.isfinite(knee_internal):
+            result[f"knee_{side}_flex"] = float(np.clip(180.0 - knee_internal, 0, 180))
+
+    if ankle is not None and toe is not None:
+        # Tobillo:
+        # Ángulo interno rodilla-tobillo-punta del pie.
+        # Referencia funcional aproximada: 90°.
+        # Si el ángulo interno baja de 90° -> dorsiflexión positiva.
+        # Si el ángulo interno sube de 90° -> plantiflexión negativa.
+        ankle_internal = vec_angle(knee, ankle, toe)
+        if np.isfinite(ankle_internal):
+            result[f"ankle_{side}_dorsi_plantar"] = float(90.0 - ankle_internal)
+
+    return result
+
+
+def compute_clinical_angles(
+    traj: pd.DataFrame,
+    vertical_axis: str = "Z",
+    invert_anterior: bool = False,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Calcula variables clínicas para cadera, rodilla y tobillo.
+    """
+    rows = []
+    notes = []
+
+    for _, row in traj.iterrows():
+        axes, source = pelvis_axes(row, vertical_axis=vertical_axis, invert_anterior=invert_anterior)
+
+        out = {
+            "Frame": row.get("Frame", np.nan),
+            "time": row.get("time", np.nan),
+            "Referencia pelvis": source,
+        }
+
+        if axes is None:
+            out.update({
+                "hip_L_flex_ext": np.nan,
+                "hip_R_flex_ext": np.nan,
+                "hip_L_abd_add": np.nan,
+                "hip_R_abd_add": np.nan,
+                "knee_L_flex": np.nan,
+                "knee_R_flex": np.nan,
+                "ankle_L_dorsi_plantar": np.nan,
+                "ankle_R_dorsi_plantar": np.nan,
+            })
+            rows.append(out)
+            continue
+
+        out.update(clinical_angles_for_row(row, "L", axes))
+        out.update(clinical_angles_for_row(row, "R", axes))
+        rows.append(out)
+
+    clinical = pd.DataFrame(rows)
+
+    if "Referencia pelvis" in clinical.columns:
+        refs = clinical["Referencia pelvis"].dropna().unique().tolist()
+        notes.append("Referencia de pelvis usada: " + " / ".join(refs[:3]))
+
+    return clinical, notes
+
+
+def metric_max_positive(df: pd.DataFrame, col: str, variable: str, movimiento: str, lado: str) -> Optional[Dict]:
+    if col not in df.columns:
+        return None
+    s = df[col].copy()
+    s = s.where(s > 0).dropna()
+    if s.empty:
+        return None
+    idx = int(s.idxmax())
+    return {
+        "Variable": variable,
+        "Movimiento": movimiento,
+        "Lado": lado,
+        "Valor (°)": float(df.loc[idx, col]),
+        "Frame": df.loc[idx, "Frame"],
+        "Tiempo (s)": df.loc[idx, "time"],
+    }
+
+
+def metric_max_negative_abs(df: pd.DataFrame, col: str, variable: str, movimiento: str, lado: str) -> Optional[Dict]:
+    if col not in df.columns:
+        return None
+    s = df[col].copy()
+    s = s.where(s < 0).dropna()
+    if s.empty:
+        return None
+    idx = int(s.idxmin())
+    return {
+        "Variable": variable,
+        "Movimiento": movimiento,
+        "Lado": lado,
+        "Valor (°)": abs(float(df.loc[idx, col])),
+        "Frame": df.loc[idx, "Frame"],
+        "Tiempo (s)": df.loc[idx, "time"],
+    }
+
+
+def metric_max(df: pd.DataFrame, col: str, variable: str, movimiento: str, lado: str) -> Optional[Dict]:
+    if col not in df.columns:
+        return None
+    s = df[col].dropna()
+    if s.empty:
+        return None
+    idx = int(s.idxmax())
+    return {
+        "Variable": variable,
+        "Movimiento": movimiento,
+        "Lado": lado,
+        "Valor (°)": float(df.loc[idx, col]),
+        "Frame": df.loc[idx, "Frame"],
+        "Tiempo (s)": df.loc[idx, "time"],
+    }
+
+
+def metric_min(df: pd.DataFrame, col: str, variable: str, movimiento: str, lado: str) -> Optional[Dict]:
+    if col not in df.columns:
+        return None
+    s = df[col].dropna()
+    if s.empty:
+        return None
+    idx = int(s.idxmin())
+    return {
+        "Variable": variable,
+        "Movimiento": movimiento,
+        "Lado": lado,
+        "Valor (°)": float(df.loc[idx, col]),
+        "Frame": df.loc[idx, "Frame"],
+        "Tiempo (s)": df.loc[idx, "time"],
+    }
+
+
+def metric_bilateral_max(df: pd.DataFrame, series: pd.Series, variable: str, movimiento: str) -> Optional[Dict]:
+    s = series.dropna()
+    if s.empty:
+        return None
+    idx = int(s.idxmax())
+    return {
+        "Variable": variable,
+        "Movimiento": movimiento,
+        "Lado": "Bilateral",
+        "Valor (°)": float(series.loc[idx]),
+        "Frame": df.loc[idx, "Frame"],
+        "Tiempo (s)": df.loc[idx, "time"],
+    }
+
+
+def clinical_summary_by_jump(clinical: pd.DataFrame, jump_type: str) -> pd.DataFrame:
+    """
+    Genera resumen clínico por tipo de salto.
+    """
+    rows = []
+
+    if clinical is None or clinical.empty:
+        return pd.DataFrame(rows)
+
+    if jump_type == "Salto carpado":
+        # Cadera: flexión y abducción
+        for side, label in [("L", "Izquierdo"), ("R", "Derecho")]:
+            rows.append(metric_max_positive(clinical, f"hip_{side}_flex_ext", "Cadera / Coxofemoral", "Flexión máxima", label))
+            rows.append(metric_max_positive(clinical, f"hip_{side}_abd_add", "Cadera / Coxofemoral", "Abducción máxima", label))
+
+        # Apertura bilateral: abducción izquierda + abducción derecha en el mismo frame
+        if "hip_L_abd_add" in clinical.columns and "hip_R_abd_add" in clinical.columns:
+            abd_total = clinical["hip_L_abd_add"].clip(lower=0) + clinical["hip_R_abd_add"].clip(lower=0)
+            rows.append(metric_bilateral_max(clinical, abd_total, "Cadera / Coxofemoral", "Apertura bilateral máxima"))
+
+        # Rodilla: extensión se reporta como menor flexión
+        for side, label in [("L", "Izquierdo"), ("R", "Derecho")]:
+            rows.append(metric_min(clinical, f"knee_{side}_flex", "Rodilla / Femorotibial", "Extensión máxima (menor flexión)", label))
+
+        # Tobillo: plantiflexión
+        for side, label in [("L", "Izquierdo"), ("R", "Derecho")]:
+            rows.append(metric_max_negative_abs(clinical, f"ankle_{side}_dorsi_plantar", "Tobillo / Tibioperoneo-astragalina", "Plantiflexión máxima", label))
+
+    elif jump_type == "Salto corza":
+        # Cadera: flexión y extensión
+        for side, label in [("L", "Izquierdo"), ("R", "Derecho")]:
+            rows.append(metric_max_positive(clinical, f"hip_{side}_flex_ext", "Cadera / Coxofemoral", "Flexión máxima", label))
+            rows.append(metric_max_negative_abs(clinical, f"hip_{side}_flex_ext", "Cadera / Coxofemoral", "Extensión máxima", label))
+
+        # Apertura anteroposterior:
+        # Caso 1: izquierda en flexión + derecha en extensión
+        # Caso 2: derecha en flexión + izquierda en extensión
+        if "hip_L_flex_ext" in clinical.columns and "hip_R_flex_ext" in clinical.columns:
+            flex_L_ext_R = clinical["hip_L_flex_ext"].clip(lower=0) + (-clinical["hip_R_flex_ext"].clip(upper=0))
+            flex_R_ext_L = clinical["hip_R_flex_ext"].clip(lower=0) + (-clinical["hip_L_flex_ext"].clip(upper=0))
+            apertura_ap = pd.concat([flex_L_ext_R, flex_R_ext_L], axis=1).max(axis=1)
+            rows.append(metric_bilateral_max(clinical, apertura_ap, "Cadera / Coxofemoral", "Apertura anteroposterior máxima"))
+
+        # Rodilla: flexión
+        for side, label in [("L", "Izquierdo"), ("R", "Derecho")]:
+            rows.append(metric_max(clinical, f"knee_{side}_flex", "Rodilla / Femorotibial", "Flexión máxima", label))
+
+        # Tobillo: dorsiflexión y plantiflexión
+        for side, label in [("L", "Izquierdo"), ("R", "Derecho")]:
+            rows.append(metric_max_positive(clinical, f"ankle_{side}_dorsi_plantar", "Tobillo / Tibioperoneo-astragalina", "Dorsiflexión máxima", label))
+            rows.append(metric_max_negative_abs(clinical, f"ankle_{side}_dorsi_plantar", "Tobillo / Tibioperoneo-astragalina", "Plantiflexión máxima", label))
+
+    rows = [r for r in rows if r is not None]
+    return pd.DataFrame(rows)
 
 def plot_com(traj: pd.DataFrame, res: Dict) -> Optional[go.Figure]:
     if traj is None or traj.empty or "CoM_Z" not in traj.columns or not traj["CoM_Z"].notna().any():
@@ -1854,6 +2241,65 @@ def main():
                     })
             st.dataframe(pd.DataFrame(rows).round(2), use_container_width=True, hide_index=True)
 
+         section("Evaluación clínica por tipo de salto")
+
+            eval_cols = st.columns([1, 1])
+            with eval_cols[0]:
+                clinical_jump_types = st.multiselect(
+                    "Tipo de salto a evaluar",
+                    ["Salto carpado", "Salto corza"],
+                    default=["Salto carpado"],
+                    key="clinical_jump_types",
+                )
+
+            with eval_cols[1]:
+                invert_anterior = st.checkbox(
+                    "Invertir eje anterior de pelvis",
+                    value=False,
+                    key="clinical_invert_anterior",
+                    help="Activar solo si al revisar el video la flexión/extensión aparece invertida.",
+                )
+
+            clinical_df, clinical_notes = compute_clinical_angles(
+                traj_clean,
+                vertical_axis="Z",
+                invert_anterior=invert_anterior,
+            )
+
+            for note in clinical_notes:
+                info_box(note, "info")
+
+            if clinical_df.empty:
+                info_box("No se pudieron calcular variables clínicas por falta de marcadores.", "warn")
+            else:
+                for jump_type in clinical_jump_types:
+                    section(jump_type)
+                    clinical_summary = clinical_summary_by_jump(clinical_df, jump_type)
+
+                    if clinical_summary.empty:
+                        info_box(f"No existen datos suficientes para evaluar {jump_type}.", "warn")
+                    else:
+                        st.dataframe(
+                            clinical_summary.round(2),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                with st.expander("Ver series clínicas completas"):
+                    st.dataframe(
+                        clinical_df.round(2),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    csv_clinical = clinical_df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇ Descargar variables clínicas",
+                        data=csv_clinical,
+                        file_name="variables_clinicas_salto.csv",
+                        mime="text/csv",
+                    )
+    
     with tabs[4]:
         section("Datos procesados")
         dataset = st.selectbox("Seleccionar tabla", ["Fuerza procesada", "Trayectoria limpia", "Ángulos", "Calidad de marcadores"])
