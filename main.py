@@ -1734,11 +1734,6 @@ def main():
                         info_box("No hay ángulos derechos válidos.", "warn")
 
             with angle_tabs[1]:
-                info_box(
-                    "Lectura: se usa 180° − ángulo interno. Así, 0° representa una alineación cercana a la extensión y "
-                    "valores mayores representan mayor movimiento angular relativo. Es una referencia visual que debe interpretarse junto con el ángulo interno geométrico.",
-                    "warn",
-                )
                 col1, col2 = st.columns(2)
                 with col1:
                     fig_l = plot_angles_flexion(angles_df, "L")
