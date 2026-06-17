@@ -2222,33 +2222,14 @@ def main():
             else:
                 info_box("CoM/Pelvis no válido por falta de LASI/RASI o datos perdidos.", "warn")
 
-            section("Estadísticas de ángulos")
-            rows = []
-            names = {"knee_L": "Rodilla Izq.", "knee_R": "Rodilla Der.", "hip_L": "Cadera Izq.", "hip_R": "Cadera Der.", "ankle_L": "Tobillo Izq.", "ankle_R": "Tobillo Der."}
-            for col, label in names.items():
-                if col in angles_df.columns and angles_df[col].notna().any():
-                    v = angles_df[col].dropna()
-                    flex_col = f"{col}_flexion"
-                    flex = angles_df[flex_col].dropna() if flex_col in angles_df.columns else pd.Series(dtype=float)
-                    rows.append({
-                        "Variable": label,
-                        "Mín interno (°)": v.min(),
-                        "Máx interno (°)": v.max(),
-                        "Media interna (°)": v.mean(),
-                        "Rango interno (°)": v.max() - v.min(),
-                        "Movimiento relativo máx. (°)": flex.max() if not flex.empty else np.nan,
-                        "Movimiento relativo medio (°)": flex.mean() if not flex.empty else np.nan,
-                    })
-            st.dataframe(pd.DataFrame(rows).round(2), use_container_width=True, hide_index=True)
 
             section("Evaluación clínica por tipo de salto")
 
             eval_cols = st.columns([1, 1])
             with eval_cols[0]:
                 clinical_jump_types = st.multiselect(
-                    "Tipo de salto a evaluar",
+                    "Seleccione el tipo de salto a evaluar",
                     ["Salto carpado", "Salto corza"],
-                    default=["Salto carpado"],
                     key="clinical_jump_types",
                 )
 
