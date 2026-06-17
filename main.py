@@ -2227,10 +2227,10 @@ def main():
 
             eval_cols = st.columns([1, 1])
             with eval_cols[0]:
-                clinical_jump_types = st.selectbox(
+                clinical_jump_type = st.radio(
                     "Seleccione el tipo de salto a evaluar",
                     ["Salto carpado", "Salto corza"],
-                    index=0,
+                    horizontal=True,
                     key="clinical_jump_type_single",
                 )
 
