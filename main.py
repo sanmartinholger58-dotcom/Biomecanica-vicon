@@ -2231,7 +2231,7 @@ def main():
                     "Seleccione el tipo de salto a evaluar",
                     ["Salto carpado", "Salto corza"],
                     index=0,
-                    key="clinical_jump_types",
+                    key="clinical_jump_type_single",
                 )
 
             with eval_cols[1]:
