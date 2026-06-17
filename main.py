@@ -2230,6 +2230,7 @@ def main():
                 clinical_jump_types = st.multiselect(
                     "Seleccione el tipo de salto a evaluar",
                     ["Salto carpado", "Salto corza"],
+                    index=0,
                     key="clinical_jump_types",
                 )
 
