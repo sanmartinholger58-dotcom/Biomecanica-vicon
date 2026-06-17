@@ -2474,7 +2474,7 @@ def main():
             eval_cols = st.columns([1, 1])
             with eval_cols[0]:
                 clinical_jump_type = st.radio(
-                    "Tipo de salto a evaluar",
+                    "Seleccion el tipo de salto a evaluar",
                     ["Salto carpado", "Salto corza"],
                     horizontal=True,
                     key="clinical_jump_type_single",
