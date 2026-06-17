@@ -2233,7 +2233,8 @@ def main():
                     horizontal=True,
                     key="clinical_jump_type_single",
                 )
-
+            clinical_jump_types = [clinical_jump_type]
+            
             with eval_cols[1]:
                 invert_anterior = st.checkbox(
                     "Invertir eje anterior de pelvis",
