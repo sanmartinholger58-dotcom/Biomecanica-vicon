@@ -2227,7 +2227,7 @@ def main():
 
             eval_cols = st.columns([1, 1])
             with eval_cols[0]:
-                clinical_jump_types = st.multiselect(
+                clinical_jump_types = st.selectbox(
                     "Seleccione el tipo de salto a evaluar",
                     ["Salto carpado", "Salto corza"],
                     index=0,
