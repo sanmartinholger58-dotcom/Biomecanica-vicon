@@ -1805,7 +1805,7 @@ def clinical_summary_by_jump(clinical: pd.DataFrame, jump_type: str) -> pd.DataF
 
         # Rodilla: extensión se reporta como menor flexión
         for side, label in [("L", "Izquierdo"), ("R", "Derecho")]:
-            rows.append(metric_min(clinical, f"knee_{side}_flex", "Rodilla / Femorotibial", "Extensión máxima (menor flexión)", label))
+            rows.append(metric_min(clinical, f"knee_{side}_flex", "Rodilla / Femorotibial", "Extensión máxima", label))
 
         # Tobillo: plantiflexión
         for side, label in [("L", "Izquierdo"), ("R", "Derecho")]:
