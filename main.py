@@ -1,5 +1,3 @@
-
-
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║         PLATAFORMA DE ANÁLISIS BIOMECÁNICO DE SALTOS — Sistema Vicon         ║
@@ -815,15 +813,10 @@ def compute_kinematics(traj: pd.DataFrame, qdf: pd.DataFrame) -> Tuple[pd.DataFr
     RTIB_ANKLE_REF = choose_marker(out, "RTIB", "RKNE")
 
     angle_specs = {
-
-        "hip_L": ("RASI", "LASI", "LTHI"),
-        "hip_R": ("LASI", "RASI", "RTHI"),
-
-
-        "knee_L": ("LTHI", "LKNE", LTIB_KNEE_REF),
-        "knee_R": ("RTHI", "RKNE", RTIB_KNEE_REF),
-
-
+        "hip_L": ("RASI", "LASI", "LKNE"),
+        "hip_R": ("LASI", "RASI", "RKNE"),
+        "knee_L": ("LASI", "LKNE", LTIB_KNEE_REF),
+        "knee_R": ("RASI", "RKNE", RTIB_KNEE_REF),
         "ankle_L": (LTIB_ANKLE_REF, "LANK", "LTOE"),
         "ankle_R": (RTIB_ANKLE_REF, "RANK", "RTOE"),
     }
@@ -999,10 +992,12 @@ def plot_angles_flexion(angles: pd.DataFrame, side: str) -> Optional[go.Figure]:
 # Se usan los marcadores disponibles en el archivo; si alguno falta, ese segmento no se dibuja.
 SKELETON_SEGMENTS = [
     ("LASI", "RASI", "Pelvis"),
-    ("LASI", "LTHI", "Muslo izquierdo"), ("LTHI", "LKNE", "Muslo izquierdo"),
-    ("LKNE", "LANK", "Pierna izquierda"), ("LANK", "LTOE", "Pie izquierdo"),
-    ("RASI", "RTHI", "Muslo derecho"), ("RTHI", "RKNE", "Muslo derecho"),
-    ("RKNE", "RANK", "Pierna derecha"), ("RANK", "RTOE", "Pie derecho"),
+    ("LASI", "LKNE", "Muslo izquierdo"),
+    ("LKNE", "LANK", "Pierna izquierda"),
+    ("LANK", "LTOE", "Pie izquierdo"),
+    ("RASI", "RKNE", "Muslo derecho"),
+    ("RKNE", "RANK", "Pierna derecha"),
+    ("RANK", "RTOE", "Pie derecho"),
 ]
 
 SKELETON_MARKERS = sorted(set([m for a, b, _ in SKELETON_SEGMENTS for m in [a, b]]))
@@ -1208,6 +1203,239 @@ def angle_summary_for_frame(angles: Optional[pd.DataFrame], idx: int, side: str 
     return " | ".join(items[:6])
 
 
+
+def clinical_video_value(row: pd.Series, col: str) -> float:
+    if row is None or col not in row.index:
+        return np.nan
+    return safe_float(row.get(col))
+
+def format_flex_ext_video(value: float) -> str:
+    value = safe_float(value)
+
+    if not np.isfinite(value):
+        return "Flex/Ext —"
+
+    if value > 0:
+        return f"Flex {value:.2f}°"
+
+    if value < 0:
+        return f"Ext {abs(value):.2f}°"
+
+    return "Neutro 0.00°"
+
+
+def flex_ext_row_value(value: float) -> Tuple[str, float]:
+    value = safe_float(value)
+
+    if not np.isfinite(value):
+        return "Flex/Ext", np.nan
+
+    if value > 0:
+        return "Flexión", float(value)
+
+    if value < 0:
+        return "Extensión", float(abs(value))
+
+    return "Neutro", 0.0
+
+def clinical_angle_summary_for_frame(
+    clinical: Optional[pd.DataFrame],
+    idx: int,
+    side: str = "Ambos",
+    jump_type: str = "Salto carpado",
+) -> str:
+    """Texto del video dividido por líneas para evitar que la evaluación clínica se vea unida."""
+    if clinical is None or clinical.empty:
+        return ""
+
+    idx = int(np.clip(idx, 0, len(clinical) - 1))
+    row = clinical.iloc[idx]
+
+    show_left = side in ["Ambos", "Izquierdo"]
+    show_right = side in ["Ambos", "Derecho"]
+
+    lines = []
+
+    if jump_type == "Salto carpado":
+        abd_l = max(clinical_video_value(row, "hip_L_abd_add"), 0)
+        abd_r = max(clinical_video_value(row, "hip_R_abd_add"), 0)
+        apertura = abd_l + abd_r if np.isfinite(abd_l) and np.isfinite(abd_r) else np.nan
+
+        if side == "Ambos" and np.isfinite(apertura):
+            lines.append(f"Evaluación clínica ({jump_type}) — Apertura bilateral: {apertura:.2f}°")
+        else:
+            lines.append(f"Evaluación clínica ({jump_type})")
+
+        cadera_items = []
+        rodilla_items = []
+        tobillo_items = []
+
+        if show_left:
+            cad_flex_ext_l = clinical_video_value(row, "hip_L_flex_ext")
+            cad_abd_l = max(clinical_video_value(row, "hip_L_abd_add"), 0)
+            rod_l = clinical_video_value(row, "knee_L_flex")
+            tob_l = max(-clinical_video_value(row, "ankle_L_dorsi_plantar"), 0)
+
+            if np.isfinite(cad_flex_ext_l) or np.isfinite(cad_abd_l):
+                cadera_items.append(
+                    f"Izquierda: {format_flex_ext_video(cad_flex_ext_l)} | Abd {cad_abd_l:.2f}°"
+                )
+
+            if np.isfinite(rod_l):
+                rodilla_items.append(f"Izquierda: {rod_l:.2f}°")
+
+            if np.isfinite(tob_l):
+                tobillo_items.append(f"Izquierda: {tob_l:.2f}°")
+
+
+        if show_right:
+            cad_flex_ext_r = clinical_video_value(row, "hip_R_flex_ext")
+            cad_abd_r = max(clinical_video_value(row, "hip_R_abd_add"), 0)
+            rod_r = clinical_video_value(row, "knee_R_flex")
+            tob_r = max(-clinical_video_value(row, "ankle_R_dorsi_plantar"), 0)
+
+            if np.isfinite(cad_flex_ext_r) or np.isfinite(cad_abd_r):
+                cadera_items.append(
+                    f"Derecha: {format_flex_ext_video(cad_flex_ext_r)} | Abd {cad_abd_r:.2f}°"
+                )
+
+
+            if np.isfinite(rod_r):
+                rodilla_items.append(f"Derecha: {rod_r:.2f}°")
+            if np.isfinite(tob_r):
+                tobillo_items.append(f"Derecha: {tob_r:.2f}°")
+
+        if cadera_items:
+            lines.append("Cadera: " + " &nbsp;&nbsp; ".join(cadera_items))
+        rt_line = []
+        if rodilla_items:
+            rt_line.append("Rodilla: " + " | ".join(rodilla_items))
+        if tobillo_items:
+            rt_line.append("Tobillo: " + " | ".join(tobillo_items))
+        if rt_line:
+            lines.append(" &nbsp;&nbsp; ".join(rt_line))
+
+    else:
+        flex_l = max(clinical_video_value(row, "hip_L_flex_ext"), 0)
+        ext_l = max(-clinical_video_value(row, "hip_L_flex_ext"), 0)
+        flex_r = max(clinical_video_value(row, "hip_R_flex_ext"), 0)
+        ext_r = max(-clinical_video_value(row, "hip_R_flex_ext"), 0)
+
+        if side == "Ambos":
+            ap_1 = flex_l + ext_r if np.isfinite(flex_l) and np.isfinite(ext_r) else np.nan
+            ap_2 = flex_r + ext_l if np.isfinite(flex_r) and np.isfinite(ext_l) else np.nan
+            apertura_ap = np.nanmax([ap_1, ap_2]) if np.isfinite(ap_1) or np.isfinite(ap_2) else np.nan
+            if np.isfinite(apertura_ap):
+                lines.append(f"Evaluación clínica ({jump_type}) — Apertura anteroposterior: {apertura_ap:.2f}°")
+            else:
+                lines.append(f"Evaluación clínica ({jump_type})")
+        else:
+            lines.append(f"Evaluación clínica ({jump_type})")
+
+        cadera_items = []
+        rodilla_items = []
+        tobillo_items = []
+
+        if show_left:
+            hip_l = clinical_video_value(row, "hip_L_flex_ext")
+            rod_l = clinical_video_value(row, "knee_L_flex")
+            tob_l_raw = clinical_video_value(row, "ankle_L_dorsi_plantar")
+            if np.isfinite(hip_l):
+                cadera_items.append(f"Izquierda: {abs(hip_l):.2f}° {'Flex' if hip_l >= 0 else 'Ext'}")
+            if np.isfinite(rod_l):
+                rodilla_items.append(f"Izquierda: {rod_l:.2f}°")
+            if np.isfinite(tob_l_raw):
+                tobillo_items.append(f"Izquierda: {abs(tob_l_raw):.2f}° {'DF' if tob_l_raw >= 0 else 'PF'}")
+
+        if show_right:
+            hip_r = clinical_video_value(row, "hip_R_flex_ext")
+            rod_r = clinical_video_value(row, "knee_R_flex")
+            tob_r_raw = clinical_video_value(row, "ankle_R_dorsi_plantar")
+            if np.isfinite(hip_r):
+                cadera_items.append(f"Derecha: {abs(hip_r):.2f}° {'Flex' if hip_r >= 0 else 'Ext'}")
+            if np.isfinite(rod_r):
+                rodilla_items.append(f"Derecha: {rod_r:.2f}°")
+            if np.isfinite(tob_r_raw):
+                tobillo_items.append(f"Derecha: {abs(tob_r_raw):.2f}° {'DF' if tob_r_raw >= 0 else 'PF'}")
+
+        if cadera_items:
+            lines.append("Cadera: " + " &nbsp;&nbsp; ".join(cadera_items))
+        rt_line = []
+        if rodilla_items:
+            rt_line.append("Rodilla flex.: " + " | ".join(rodilla_items))
+        if tobillo_items:
+            rt_line.append("Tobillo: " + " | ".join(tobillo_items))
+        if rt_line:
+            lines.append(" &nbsp;&nbsp; ".join(rt_line))
+
+    return "<br>".join(lines)
+
+def current_clinical_angles_table(
+    clinical: Optional[pd.DataFrame],
+    idx: int,
+    jump_type: str,
+    side: str = "Ambos",
+) -> pd.DataFrame:
+    """Tabla del frame manual con las mismas variables clínicas usadas en el video."""
+    if clinical is None or clinical.empty:
+        return pd.DataFrame()
+    idx = int(np.clip(idx, 0, len(clinical) - 1))
+    row = clinical.iloc[idx]
+    rows = []
+    show_left = side in ["Ambos", "Izquierdo"]
+    show_right = side in ["Ambos", "Derecho"]
+
+    def add(variable, movimiento, lado, valor):
+        if np.isfinite(valor):
+            rows.append({
+                "Variable": variable,
+                "Movimiento": movimiento,
+                "Lado": lado,
+                "Valor actual (°)": float(valor),
+            })
+
+    if jump_type == "Salto carpado":
+        if show_left:
+            add("Cadera / Coxofemoral", "Flexión", "Izquierdo", max(clinical_video_value(row, "hip_L_flex_ext"), 0))
+            add("Cadera / Coxofemoral", "Abducción", "Izquierdo", max(clinical_video_value(row, "hip_L_abd_add"), 0))
+            add("Rodilla / Femorotibial", "Flexión residual", "Izquierdo", clinical_video_value(row, "knee_L_flex"))
+            add("Tobillo / Tibioperoneo-astragalina", "Plantiflexión", "Izquierdo", max(-clinical_video_value(row, "ankle_L_dorsi_plantar"), 0))
+        if show_right:
+            add("Cadera / Coxofemoral", "Flexión", "Derecho", max(clinical_video_value(row, "hip_R_flex_ext"), 0))
+            add("Cadera / Coxofemoral", "Abducción", "Derecho", max(clinical_video_value(row, "hip_R_abd_add"), 0))
+            add("Rodilla / Femorotibial", "Flexión residual", "Derecho", clinical_video_value(row, "knee_R_flex"))
+            add("Tobillo / Tibioperoneo-astragalina", "Plantiflexión", "Derecho", max(-clinical_video_value(row, "ankle_R_dorsi_plantar"), 0))
+        if side == "Ambos":
+            abd_l = max(clinical_video_value(row, "hip_L_abd_add"), 0)
+            abd_r = max(clinical_video_value(row, "hip_R_abd_add"), 0)
+            if np.isfinite(abd_l) and np.isfinite(abd_r):
+                add("Cadera / Coxofemoral", "Apertura bilateral", "Bilateral", abd_l + abd_r)
+    else:
+        if side == "Ambos":
+            flex_l = max(clinical_video_value(row, "hip_L_flex_ext"), 0)
+            ext_l = max(-clinical_video_value(row, "hip_L_flex_ext"), 0)
+            flex_r = max(clinical_video_value(row, "hip_R_flex_ext"), 0)
+            ext_r = max(-clinical_video_value(row, "hip_R_flex_ext"), 0)
+            ap_1 = flex_l + ext_r if np.isfinite(flex_l) and np.isfinite(ext_r) else np.nan
+            ap_2 = flex_r + ext_l if np.isfinite(flex_r) and np.isfinite(ext_l) else np.nan
+            apertura_ap = np.nanmax([ap_1, ap_2]) if np.isfinite(ap_1) or np.isfinite(ap_2) else np.nan
+            add("Cadera / Coxofemoral", "Apertura anteroposterior", "Bilateral", apertura_ap)
+        if show_left:
+            hip_l = clinical_video_value(row, "hip_L_flex_ext")
+            add("Cadera / Coxofemoral", "Flexión" if hip_l >= 0 else "Extensión", "Izquierdo", abs(hip_l))
+            add("Rodilla / Femorotibial", "Flexión", "Izquierdo", clinical_video_value(row, "knee_L_flex"))
+            tob_l = clinical_video_value(row, "ankle_L_dorsi_plantar")
+            add("Tobillo / Tibioperoneo-astragalina", "Dorsiflexión" if tob_l >= 0 else "Plantiflexión", "Izquierdo", abs(tob_l))
+        if show_right:
+            hip_r = clinical_video_value(row, "hip_R_flex_ext")
+            add("Cadera / Coxofemoral", "Flexión" if hip_r >= 0 else "Extensión", "Derecho", abs(hip_r))
+            add("Rodilla / Femorotibial", "Flexión", "Derecho", clinical_video_value(row, "knee_R_flex"))
+            tob_r = clinical_video_value(row, "ankle_R_dorsi_plantar")
+            add("Tobillo / Tibioperoneo-astragalina", "Dorsiflexión" if tob_r >= 0 else "Plantiflexión", "Derecho", abs(tob_r))
+
+    return pd.DataFrame(rows)
+
+
 def frame_indices_for_animation(traj: pd.DataFrame, stride: int, max_frames: int = 350) -> List[int]:
     """Reduce frames para que la animación sea ligera en Streamlit Cloud."""
     n = len(traj)
@@ -1288,6 +1516,8 @@ def skeleton_trace_data_3d(
 def plot_skeleton_2d_animation(
     traj: pd.DataFrame,
     angles: Optional[pd.DataFrame] = None,
+    clinical: Optional[pd.DataFrame] = None,
+    jump_type: str = "Salto carpado",
     plane: str = "X-Z",
     side: str = "Ambos",
     center_on_pelvis: bool = True,
@@ -1311,10 +1541,10 @@ def plot_skeleton_2d_animation(
     for idx in idxs:
         row = traj.iloc[idx]
         t = safe_float(row.get("time"), 0)
-        summary = angle_summary_for_frame(angles, idx, side)
+        summary = clinical_angle_summary_for_frame(clinical, idx, side, jump_type)
         title = f"Video 2D del movimiento | Frame {int(row['Frame'])} | t = {t:.3f} s"
         if summary:
-            title += f"<br><sup>Movimiento angular relativo estimado: {summary}</sup>"
+            title += f"<br><sup>{summary}</sup>"
         frame_name = str(idx)
         frames.append(go.Frame(
             name=frame_name,
@@ -1328,9 +1558,9 @@ def plot_skeleton_2d_animation(
         ))
 
     fig.frames = frames
-    base = base_layout("Video 2D del movimiento", 540)
+    base = base_layout("Video 2D del movimiento", 585)
     base.update(
-        margin=dict(l=55, r=25, t=75, b=55),
+        margin=dict(l=55, r=25, t=115, b=55),
         xaxis=dict(title=x_title, range=x_range, gridcolor=COLORS["grid"], zerolinecolor=COLORS["grid"]),
         yaxis=dict(title=y_title, range=y_range, gridcolor=COLORS["grid"], zerolinecolor=COLORS["grid"], scaleanchor="x", scaleratio=1),
         updatemenus=[dict(
@@ -1360,6 +1590,8 @@ def plot_skeleton_2d_animation(
 def plot_skeleton_3d_animation(
     traj: pd.DataFrame,
     angles: Optional[pd.DataFrame] = None,
+    clinical: Optional[pd.DataFrame] = None,
+    jump_type: str = "Salto carpado",
     side: str = "Ambos",
     center_on_pelvis: bool = True,
     show_labels: bool = False,
@@ -1381,10 +1613,10 @@ def plot_skeleton_3d_animation(
     for idx in idxs:
         row = traj.iloc[idx]
         t = safe_float(row.get("time"), 0)
-        summary = angle_summary_for_frame(angles, idx, side)
+        summary = clinical_angle_summary_for_frame(clinical, idx, side, jump_type)
         title = f"Video 3D del movimiento | Frame {int(row['Frame'])} | t = {t:.3f} s"
         if summary:
-            title += f"<br><sup>Movimiento angular relativo estimado: {summary}</sup>"
+            title += f"<br><sup>{summary}</sup>"
         frame_name = str(idx)
         frames.append(go.Frame(
             name=frame_name,
@@ -1398,9 +1630,9 @@ def plot_skeleton_3d_animation(
         ))
 
     fig.frames = frames
-    base = base_layout("Video 3D del movimiento", 570)
+    base = base_layout("Video 3D del movimiento", 620)
     base.update(
-        margin=dict(l=55, r=25, t=75, b=55),
+        margin=dict(l=55, r=25, t=115, b=55),
         scene=scene,
         updatemenus=[dict(
             type="buttons",
@@ -1805,7 +2037,7 @@ def clinical_summary_by_jump(clinical: pd.DataFrame, jump_type: str) -> pd.DataF
 
         # Rodilla: extensión se reporta como menor flexión
         for side, label in [("L", "Izquierdo"), ("R", "Derecho")]:
-            rows.append(metric_min(clinical, f"knee_{side}_flex", "Rodilla / Femorotibial", "Extensión máxima", label))
+            rows.append(metric_min(clinical, f"knee_{side}_flex", "Rodilla / Femorotibial", "Rodilla extendida máxima", label))
 
         # Tobillo: plantiflexión
         for side, label in [("L", "Izquierdo"), ("R", "Derecho")]:
@@ -2101,6 +2333,14 @@ def main():
         if traj_clean is None or angles_df is None:
             info_box("No se cargó trayectoria o no pudo procesarse. El análisis de fuerza sigue siendo válido.", "warn")
         else:
+            clinical_jump_type = st.session_state.get("clinical_jump_type_single", "Salto carpado")
+            invert_anterior = st.session_state.get("clinical_invert_anterior", False)
+            clinical_df, clinical_notes = compute_clinical_angles(
+                traj_clean,
+                vertical_axis="Z",
+                invert_anterior=invert_anterior,
+            )
+
             section("Ángulos articulares")
             
 
@@ -2166,15 +2406,17 @@ def main():
             if viewer_control == "Video / reproducción continua":
                 if viewer_mode == "2D":
                     fig_skel = plot_skeleton_2d_animation(
-                        traj_clean, angles_df, plane=plane, side=viewer_side,
-                        center_on_pelvis=center_pelvis, show_labels=show_labels,
-                        stride=int(frame_stride), frame_duration_ms=int(frame_duration_ms),
+                        traj_clean, angles_df, clinical=clinical_df, jump_type=clinical_jump_type,
+                        plane=plane, side=viewer_side, center_on_pelvis=center_pelvis,
+                        show_labels=show_labels, stride=int(frame_stride),
+                        frame_duration_ms=int(frame_duration_ms),
                     )
                 else:
                     fig_skel = plot_skeleton_3d_animation(
-                        traj_clean, angles_df, side=viewer_side,
-                        center_on_pelvis=center_pelvis, show_labels=show_labels,
-                        stride=int(frame_stride), frame_duration_ms=int(frame_duration_ms),
+                        traj_clean, angles_df, clinical=clinical_df, jump_type=clinical_jump_type,
+                        side=viewer_side, center_on_pelvis=center_pelvis,
+                        show_labels=show_labels, stride=int(frame_stride),
+                        frame_duration_ms=int(frame_duration_ms),
                     )
 
                 if fig_skel is not None:
@@ -2211,9 +2453,13 @@ def main():
                 if fig_skel is not None:
                     st.plotly_chart(fig_skel, use_container_width=True, key="kinematics_skeleton_manual")
                 else:
-                    info_box("No se pudo dibujar el exoesqueleto. Revise que existan marcadores LASI/RASI, LTHI/RTHI, LKNE/RKNE, LANK/RANK y LTOE/RTOE.", "warn")
+                    info_box("No se pudo dibujar el exoesqueleto. Revise que existan marcadores LASI/RASI, LKNE/RKNE, LANK/RANK y LTOE/RTOE.", "warn")
 
-                st.dataframe(current_angles_table(angles_df, frame_idx).round(2), use_container_width=True, hide_index=True)
+                current_clinical = current_clinical_angles_table(
+                    clinical_df, frame_idx, clinical_jump_type, viewer_side
+                )
+                if not current_clinical.empty:
+                    st.dataframe(current_clinical.round(2), use_container_width=True, hide_index=True)
 
             section("Trayectoria vertical del Centro de Masa/Pelvis")
             fig_com = plot_com(traj_clean, res)
@@ -2228,13 +2474,14 @@ def main():
             eval_cols = st.columns([1, 1])
             with eval_cols[0]:
                 clinical_jump_type = st.radio(
-                    "Seleccione el tipo de salto a evaluar",
+                    "Tipo de salto a evaluar",
                     ["Salto carpado", "Salto corza"],
                     horizontal=True,
                     key="clinical_jump_type_single",
                 )
-            clinical_jump_types = [clinical_jump_type]
-            
+
+                clinical_jump_types = [clinical_jump_type]
+
             with eval_cols[1]:
                 invert_anterior = st.checkbox(
                     "Invertir eje anterior de pelvis",
@@ -2242,12 +2489,6 @@ def main():
                     key="clinical_invert_anterior",
                     help="Activar solo si al revisar el video la flexión/extensión aparece invertida.",
                 )
-
-            clinical_df, clinical_notes = compute_clinical_angles(
-                traj_clean,
-                vertical_axis="Z",
-                invert_anterior=invert_anterior,
-            )
 
             for note in clinical_notes:
                 info_box(note, "info")
@@ -2285,7 +2526,7 @@ def main():
     
     with tabs[4]:
         section("Datos procesados")
-        dataset = st.selectbox("Seleccionar tabla", ["Fuerza procesada", "Trayectoria limpia", "Ángulos", "Calidad de marcadores"])
+        dataset = st.selectbox("Seleccionar tabla", ["Fuerza procesada", "Trayectoria limpia", "Calidad de marcadores"])
         if dataset == "Fuerza procesada":
             cols = [c for c in ["time", "Frame", "SubFrame", "GRF_x", "GRF_y", "GRF_z", "GRF_z_filt", "CoP_X", "CoP_Y"] if c in f.columns]
             st.dataframe(f[cols].head(500).round(4), use_container_width=True)
@@ -2296,13 +2537,6 @@ def main():
                 st.dataframe(traj_clean.head(500).round(4), use_container_width=True)
                 csv = traj_clean.to_csv(index=False).encode("utf-8")
                 st.download_button("⬇ Descargar trayectoria limpia", data=csv, file_name="trayectoria_limpia.csv", mime="text/csv")
-            else:
-                st.warning("No disponible.")
-        elif dataset == "Ángulos":
-            if angles_df is not None:
-                st.dataframe(angles_df.head(500).round(4), use_container_width=True)
-                csv = angles_df.to_csv(index=False).encode("utf-8")
-                st.download_button("⬇ Descargar ángulos", data=csv, file_name="angulos.csv", mime="text/csv")
             else:
                 st.warning("No disponible.")
         else:
