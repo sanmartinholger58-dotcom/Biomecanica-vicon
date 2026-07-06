@@ -2086,6 +2086,966 @@ def plot_com(traj: pd.DataFrame, res: Dict) -> Optional[go.Figure]:
     fig.update_yaxes(title_text="Altura (mm)")
     return fig
 
+
+# =============================================================================
+# Cinemática clínica desde Nexus Model Outputs
+# =============================================================================
+
+@st.cache_data(show_spinner=False)
+def parse_nexus_model_outputs(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Parser para CSV exportado desde Vicon Nexus en Model Outputs.
+
+    Lee:
+    - LHipAngles / RHipAngles
+    - LKneeAngles / RKneeAngles
+    - LAnkleAngles / RAnkleAngles
+    - centros de segmento TX/TY/TZ si están disponibles.
+    """
+    import csv
+
+    raw_text = file_bytes.decode("utf-8-sig", errors="replace")
+    rows = list(csv.reader(raw_text.splitlines()))
+
+    if len(rows) < 6:
+        raise ValueError("El archivo no tiene suficientes filas para ser un Model Outputs de Nexus.")
+
+    fs = np.nan
+    try:
+        fs = float(str(rows[1][0]).strip())
+    except Exception:
+        pass
+
+    names = rows[2] if len(rows) > 2 else []
+    comps = rows[3] if len(rows) > 3 else []
+    units = rows[4] if len(rows) > 4 else []
+    data_rows = rows[5:]
+
+    max_data_cols = max([len(r) for r in data_rows], default=0)
+    ncols = max(len(names), len(comps), len(units), max_data_cols)
+
+    def cell(row, idx):
+        return str(row[idx]).strip() if idx < len(row) else ""
+
+    current = ""
+    cols = []
+    unit_map = {}
+
+    for i in range(ncols):
+        name = cell(names, i)
+        comp = cell(comps, i)
+        unit = cell(units, i)
+
+        if name:
+            current = name.split(":")[-1].strip()
+
+        if i == 0:
+            col = "Frame"
+        elif i == 1:
+            col = "SubFrame"
+        else:
+            base = current if current else f"Output_{i}"
+            col = f"{base}_{comp}" if comp else base
+
+        original_col = col
+        k = 2
+        while col in cols:
+            col = f"{original_col}_{k}"
+            k += 1
+
+        cols.append(col)
+        unit_map[col] = unit
+
+    normalized_rows = []
+    for r in data_rows:
+        if not any(str(v).strip() for v in r):
+            continue
+        if len(r) < ncols:
+            r = r + [""] * (ncols - len(r))
+        elif len(r) > ncols:
+            r = r[:ncols]
+        normalized_rows.append(r)
+
+    df = pd.DataFrame(normalized_rows, columns=cols)
+    for c in df.columns:
+        df[c] = df[c].map(fix_decimal)
+
+    df = df.dropna(subset=["Frame"]).reset_index(drop=True)
+    df["Frame"] = df["Frame"].astype(int)
+
+    outputs = sorted(set(c.rsplit("_", 1)[0] for c in df.columns if "_" in c and c != "SubFrame"))
+    meta = {
+        "Frecuencia (Hz)": fs,
+        "Filas": len(df),
+        "Frame inicial": int(df["Frame"].min()) if len(df) else None,
+        "Frame final": int(df["Frame"].max()) if len(df) else None,
+        "Columnas": len(df.columns),
+        "Salidas": outputs,
+        "Unidades": unit_map,
+    }
+    return df, meta
+
+
+def validate_nexus_angles(raw_angles: pd.DataFrame) -> List[Dict]:
+    expected = [
+        "LHipAngles_X", "LHipAngles_Y", "LHipAngles_Z",
+        "RHipAngles_X", "RHipAngles_Y", "RHipAngles_Z",
+        "LKneeAngles_X", "LKneeAngles_Y", "LKneeAngles_Z",
+        "RKneeAngles_X", "RKneeAngles_Y", "RKneeAngles_Z",
+        "LAnkleAngles_X", "LAnkleAngles_Y", "LAnkleAngles_Z",
+        "RAnkleAngles_X", "RAnkleAngles_Y", "RAnkleAngles_Z",
+    ]
+    available = [c for c in expected if c in raw_angles.columns and raw_angles[c].notna().any()]
+    status = "OK" if len(available) >= 6 else ("REVISAR" if len(available) > 0 else "NO VÁLIDO")
+    return [{
+        "Elemento": "Ángulos Nexus",
+        "Estado": status,
+        "Detalle": f"{len(available)}/{len(expected)} componentes articulares disponibles. Fuente clínica principal: Model Outputs."
+    }]
+
+
+def build_nexus_clinical_df(raw_angles: pd.DataFrame, normalize_angles: bool = False) -> pd.DataFrame:
+    out = pd.DataFrame({"Frame": raw_angles["Frame"]})
+    if "SubFrame" in raw_angles.columns:
+        out["SubFrame"] = raw_angles["SubFrame"]
+
+    first_frame = safe_float(raw_angles["Frame"].iloc[0], 0)
+    fs = 100.0
+    out["time"] = (raw_angles["Frame"] - first_frame) / fs
+
+    def get(col: str) -> pd.Series:
+        if col not in raw_angles.columns:
+            return pd.Series(np.nan, index=raw_angles.index, dtype=float)
+        s = pd.to_numeric(raw_angles[col], errors="coerce").astype(float)
+        if normalize_angles:
+            s = pd.Series(((s + 180.0) % 360.0) - 180.0, index=raw_angles.index)
+        return s
+
+    # Convención usada para análisis clínico:
+    # X = flexión/extensión, Y = abducción/aducción, Z = rotación.
+    out["hip_L_flex_ext"] = get("LHipAngles_X")
+    out["hip_R_flex_ext"] = get("RHipAngles_X")
+    out["hip_L_abd_add"] = get("LHipAngles_Y")
+    out["hip_R_abd_add"] = get("RHipAngles_Y")
+    out["hip_L_rot"] = get("LHipAngles_Z")
+    out["hip_R_rot"] = get("RHipAngles_Z")
+
+    out["knee_L_flex_ext"] = get("LKneeAngles_X")
+    out["knee_R_flex_ext"] = get("RKneeAngles_X")
+    out["knee_L_abd_add"] = get("LKneeAngles_Y")
+    out["knee_R_abd_add"] = get("RKneeAngles_Y")
+    out["knee_L_rot"] = get("LKneeAngles_Z")
+    out["knee_R_rot"] = get("RKneeAngles_Z")
+
+    out["ankle_L_dorsi_plantar"] = get("LAnkleAngles_X")
+    out["ankle_R_dorsi_plantar"] = get("RAnkleAngles_X")
+    out["ankle_L_abd_add"] = get("LAnkleAngles_Y")
+    out["ankle_R_abd_add"] = get("RAnkleAngles_Y")
+    out["ankle_L_rot"] = get("LAnkleAngles_Z")
+    out["ankle_R_rot"] = get("RAnkleAngles_Z")
+
+    out["hip_abd_bilateral_abs"] = out["hip_L_abd_add"].abs() + out["hip_R_abd_add"].abs()
+
+    flex_l = out["hip_L_flex_ext"].clip(lower=0)
+    ext_l = (-out["hip_L_flex_ext"]).clip(lower=0)
+    flex_r = out["hip_R_flex_ext"].clip(lower=0)
+    ext_r = (-out["hip_R_flex_ext"]).clip(lower=0)
+    out["hip_apertura_ap"] = pd.concat([flex_l + ext_r, flex_r + ext_l], axis=1).max(axis=1)
+
+    return out
+
+
+def add_event_markers_nexus(fig: go.Figure, res: Dict, x_col: str = "Frame"):
+    try:
+        f = res["force_df"]
+        ev: JumpEvent = res["event"]
+        if x_col == "Frame" and "Frame" in f.columns:
+            x_to = f["Frame"].iloc[ev.takeoff_idx]
+            x_la = f["Frame"].iloc[ev.landing_idx]
+        else:
+            x_to = f["time"].iloc[ev.takeoff_idx]
+            x_la = f["time"].iloc[ev.landing_idx]
+        fig.add_vline(x=x_to, line_dash="dot", line_color=COLORS["accent"], line_width=2,
+                      annotation_text="Despegue", annotation_font_color=COLORS["accent"])
+        fig.add_vline(x=x_la, line_dash="dot", line_color=COLORS["secondary"], line_width=2,
+                      annotation_text="Aterrizaje", annotation_font_color=COLORS["secondary"])
+    except Exception:
+        pass
+
+
+def plot_nexus_component(raw_angles: pd.DataFrame, side: str, component: str, res: Optional[Dict] = None) -> Optional[go.Figure]:
+    if raw_angles is None or raw_angles.empty:
+        return None
+    component_titles = {
+        "X": "Flexión y extensión",
+        "Y": "Abducción y aducción",
+        "Z": "Rotación",
+    }
+    side_prefix = "L" if side == "L" else "R"
+    side_name = "Izquierdo" if side == "L" else "Derecho"
+    joints = [
+        ("HipAngles", "Cadera"),
+        ("KneeAngles", "Rodilla"),
+        ("AnkleAngles", "Tobillo"),
+    ]
+    fig = go.Figure()
+    for nexus_joint, label in joints:
+        col = f"{side_prefix}{nexus_joint}_{component}"
+        if col in raw_angles.columns and raw_angles[col].notna().any():
+            fig.add_trace(go.Scatter(x=raw_angles["Frame"], y=raw_angles[col], name=label, line=dict(width=2.4)))
+    if len(fig.data) == 0:
+        return None
+    fig.update_layout(**base_layout(f"{component_titles.get(component, component)} - Lado {side_name}", 360))
+    fig.update_xaxes(title_text="Frame")
+    fig.update_yaxes(title_text="Ángulo Nexus (°)")
+    fig.add_hline(y=0, line_dash="dot", line_color=COLORS["grid"], opacity=0.8)
+    if res is not None:
+        add_event_markers_nexus(fig, res, x_col="Frame")
+    return fig
+
+
+def metric_max(df: pd.DataFrame, col: str, variable: str, movement: str, side: str) -> Optional[Dict]:
+    if col not in df.columns or not df[col].notna().any():
+        return None
+    s = df[col].astype(float)
+    idx = int(s.idxmax())
+    return {
+        "Variable": variable,
+        "Movimiento": movement,
+        "Lado": side,
+        "Valor (°)": float(s.loc[idx]),
+        "Frame": int(df.loc[idx, "Frame"]),
+        "Tiempo (s)": safe_float(df.loc[idx, "time"]),
+    }
+
+
+def metric_min_as_abs(df: pd.DataFrame, col: str, variable: str, movement: str, side: str) -> Optional[Dict]:
+    if col not in df.columns or not df[col].notna().any():
+        return None
+    s = df[col].astype(float)
+    idx = int(s.idxmin())
+    return {
+        "Variable": variable,
+        "Movimiento": movement,
+        "Lado": side,
+        "Valor (°)": float(abs(s.loc[idx])),
+        "Frame": int(df.loc[idx, "Frame"]),
+        "Tiempo (s)": safe_float(df.loc[idx, "time"]),
+    }
+
+
+def metric_absmax(df: pd.DataFrame, col: str, variable: str, movement: str, side: str) -> Optional[Dict]:
+    if col not in df.columns or not df[col].notna().any():
+        return None
+    s = df[col].astype(float).abs()
+    idx = int(s.idxmax())
+    return {
+        "Variable": variable,
+        "Movimiento": movement,
+        "Lado": side,
+        "Valor (°)": float(s.loc[idx]),
+        "Frame": int(df.loc[idx, "Frame"]),
+        "Tiempo (s)": safe_float(df.loc[idx, "time"]),
+    }
+
+
+def metric_bilateral(df: pd.DataFrame, series: pd.Series, variable: str, movement: str) -> Optional[Dict]:
+    if series is None or not series.notna().any():
+        return None
+    idx = int(series.idxmax())
+    return {
+        "Variable": variable,
+        "Movimiento": movement,
+        "Lado": "Bilateral",
+        "Valor (°)": float(series.loc[idx]),
+        "Frame": int(df.loc[idx, "Frame"]),
+        "Tiempo (s)": safe_float(df.loc[idx, "time"]),
+    }
+
+
+def nexus_summary_by_jump(nexus_clin: pd.DataFrame, jump_type: str) -> pd.DataFrame:
+    rows = []
+
+    if jump_type == "Salto carpado":
+        for side, label in [("L", "Izquierdo"), ("R", "Derecho")]:
+            rows.append(metric_max(nexus_clin, f"hip_{side}_flex_ext", "Cadera / Coxofemoral", "Flexión máxima", label))
+            rows.append(metric_absmax(nexus_clin, f"hip_{side}_abd_add", "Cadera / Coxofemoral", "Abducción/aducción máxima", label))
+            rows.append(metric_absmax(nexus_clin, f"knee_{side}_flex_ext", "Rodilla / Femorotibial", "Flexión/extensión máxima", label))
+            rows.append(metric_absmax(nexus_clin, f"ankle_{side}_dorsi_plantar", "Tobillo / Tibioperoneo-astragalina", "Dorsi/plantiflexión máxima", label))
+
+        if "hip_abd_bilateral_abs" in nexus_clin.columns:
+            rows.append(metric_bilateral(nexus_clin, nexus_clin["hip_abd_bilateral_abs"], "Cadera / Coxofemoral", "Apertura bilateral Nexus (Y)"))
+
+    else:
+        for side, label in [("L", "Izquierdo"), ("R", "Derecho")]:
+            rows.append(metric_max(nexus_clin, f"hip_{side}_flex_ext", "Cadera / Coxofemoral", "Flexión máxima", label))
+            rows.append(metric_min_as_abs(nexus_clin, f"hip_{side}_flex_ext", "Cadera / Coxofemoral", "Extensión máxima", label))
+            rows.append(metric_absmax(nexus_clin, f"knee_{side}_flex_ext", "Rodilla / Femorotibial", "Flexión/extensión máxima", label))
+            rows.append(metric_absmax(nexus_clin, f"ankle_{side}_dorsi_plantar", "Tobillo / Tibioperoneo-astragalina", "Dorsi/plantiflexión máxima", label))
+
+        if "hip_apertura_ap" in nexus_clin.columns:
+            rows.append(metric_bilateral(nexus_clin, nexus_clin["hip_apertura_ap"], "Cadera / Coxofemoral", "Apertura anteroposterior Nexus (X)"))
+
+    rows = [r for r in rows if r is not None]
+    return pd.DataFrame(rows)
+
+
+def opposite_movement(name: str) -> str:
+    pairs = {
+        "Flexión": "Extensión",
+        "Extensión": "Flexión",
+        "Abducción": "Aducción",
+        "Aducción": "Abducción",
+        "Dorsiflexión": "Plantiflexión",
+        "Plantiflexión": "Dorsiflexión",
+        "Rotación externa": "Rotación interna",
+        "Rotación interna": "Rotación externa",
+    }
+    return pairs.get(name, "Movimiento opuesto")
+
+
+def signed_movement(value: float, positive_label: str) -> str:
+    value = safe_float(value)
+    if not np.isfinite(value):
+        return "—"
+    if abs(value) < 1e-9:
+        return "Neutro"
+    return positive_label if value > 0 else opposite_movement(positive_label)
+
+
+def current_nexus_detail_table(
+    raw_angles: pd.DataFrame,
+    frame: int,
+    side_filter: str = "Ambos",
+    hip_x_positive: str = "Flexión",
+    knee_x_positive: str = "Flexión",
+    ankle_x_positive: str = "Dorsiflexión",
+    hip_y_positive: str = "Abducción",
+) -> pd.DataFrame:
+    row = raw_angles[raw_angles["Frame"] == int(frame)]
+    if row.empty:
+        return pd.DataFrame()
+    row = row.iloc[0]
+    sides = []
+    if side_filter in ["Ambos", "Izquierdo"]:
+        sides.append(("L", "Izquierdo"))
+    if side_filter in ["Ambos", "Derecho"]:
+        sides.append(("R", "Derecho"))
+
+    rows = []
+    joint_info = [
+        ("HipAngles", "Cadera / Coxofemoral", hip_x_positive, hip_y_positive),
+        ("KneeAngles", "Rodilla / Femorotibial", knee_x_positive, "Abducción"),
+        ("AnkleAngles", "Tobillo / Tibioperoneo-astragalina", ankle_x_positive, "Abducción"),
+    ]
+    for s, side_name in sides:
+        for joint, joint_name, x_pos, y_pos in joint_info:
+            values = [
+                ("X", "Flexión y extensión" if joint != "AnkleAngles" else "Dorsiflexión y plantiflexión", x_pos, row.get(f"{s}{joint}_X")),
+                ("Y", "Abducción y aducción", y_pos, row.get(f"{s}{joint}_Y")),
+                ("Z", "Rotación", "Rotación externa", row.get(f"{s}{joint}_Z")),
+            ]
+            for eje, componente, positivo, val in values:
+                v = safe_float(val)
+                rows.append({
+                    "Frame": int(frame),
+                    "Lado": side_name,
+                    "Articulación": joint_name,
+                    "Eje": eje,
+                    "Componente": componente,
+                    "Lectura": signed_movement(v, positivo),
+                    "Valor con signo (°)": v,
+                    "Valor clínico abs. (°)": abs(v) if np.isfinite(v) else np.nan,
+                    "Origen": "Nexus Model Outputs",
+                })
+    return pd.DataFrame(rows)
+
+
+# --------------------------- Visualizador del modelo Nexus --------------------
+
+NEXUS_SEGMENT_SEQUENCES = [
+    ("Izquierdo", ["PEL", "LFE", "LTI", "LFO", "LTO"]),
+    ("Derecho", ["PEL", "RFE", "RTI", "RFO", "RTO"]),
+]
+
+
+def nexus_segment_names(df: Optional[pd.DataFrame]) -> List[str]:
+    if df is None or df.empty:
+        return []
+    candidates = ["PEL", "LFE", "LTI", "LFO", "LTO", "RFE", "RTI", "RFO", "RTO"]
+    return [s for s in candidates if all(f"{s}_{ax}" in df.columns for ax in ["TX", "TY", "TZ"])]
+
+
+def nexus_row_by_frame(df: Optional[pd.DataFrame], frame: int) -> Optional[pd.Series]:
+    if df is None or df.empty or "Frame" not in df.columns:
+        return None
+    row = df[df["Frame"] == int(frame)]
+    if row.empty:
+        return None
+    return row.iloc[0]
+
+
+def nexus_segment_point(row: pd.Series, segment: str, center_on_pelvis: bool = True) -> Optional[np.ndarray]:
+    cols = [f"{segment}_TX", f"{segment}_TY", f"{segment}_TZ"]
+    if not all(c in row.index for c in cols):
+        return None
+    p = np.array([safe_float(row.get(c)) for c in cols], dtype=float)
+    if np.any(~np.isfinite(p)):
+        return None
+    if center_on_pelvis and all(c in row.index for c in ["PEL_TX", "PEL_TY", "PEL_TZ"]):
+        pel = np.array([safe_float(row.get("PEL_TX")), safe_float(row.get("PEL_TY")), safe_float(row.get("PEL_TZ"))], dtype=float)
+        if np.all(np.isfinite(pel)):
+            p = p - pel
+    return p
+
+
+def nexus_model_limits(df: pd.DataFrame, center_on_pelvis: bool = True, axes=(0, 2)) -> Tuple[List[float], List[float]]:
+    xs, ys = [], []
+    segs = nexus_segment_names(df)
+    for _, row in df.iterrows():
+        for seg in segs:
+            p = nexus_segment_point(row, seg, center_on_pelvis=center_on_pelvis)
+            if p is not None:
+                xs.append(p[axes[0]])
+                ys.append(p[axes[1]])
+    if not xs or not ys:
+        return [-500, 500], [-500, 500]
+    x0, x1 = np.nanpercentile(xs, [2, 98])
+    y0, y1 = np.nanpercentile(ys, [2, 98])
+    pad_x = max((x1 - x0) * 0.18, 80)
+    pad_y = max((y1 - y0) * 0.18, 80)
+    return [float(x0 - pad_x), float(x1 + pad_x)], [float(y0 - pad_y), float(y1 + pad_y)]
+
+
+def overlay_component_values(raw_angles: pd.DataFrame, frame: int, family: str) -> Dict[str, Dict[str, float]]:
+    row = nexus_row_by_frame(raw_angles, frame)
+    if row is None:
+        return {}
+    family_map = {
+        "Flexión y extensión": "X",
+        "Abducción y aducción": "Y",
+        "Rotación": "Z",
+    }
+    comp = family_map.get(family, "X")
+    return {
+        "L": {
+            "hip": safe_float(row.get(f"LHipAngles_{comp}")),
+            "knee": safe_float(row.get(f"LKneeAngles_{comp}")),
+            "ankle": safe_float(row.get(f"LAnkleAngles_{comp}")),
+        },
+        "R": {
+            "hip": safe_float(row.get(f"RHipAngles_{comp}")),
+            "knee": safe_float(row.get(f"RKneeAngles_{comp}")),
+            "ankle": safe_float(row.get(f"RAnkleAngles_{comp}")),
+        },
+    }
+
+
+def joint_overlay_positions_2d(row: pd.Series, ix: int, iy: int, center_on_pelvis: bool = True) -> Dict[str, Tuple[float, float]]:
+    positions = {}
+    for side_code, fem, tib, foot in [("L", "LFE", "LTI", "LFO"), ("R", "RFE", "RTI", "RFO")]:
+        pel = nexus_segment_point(row, "PEL", center_on_pelvis=center_on_pelvis)
+        femp = nexus_segment_point(row, fem, center_on_pelvis=center_on_pelvis)
+        tibp = nexus_segment_point(row, tib, center_on_pelvis=center_on_pelvis)
+        footp = nexus_segment_point(row, foot, center_on_pelvis=center_on_pelvis)
+        if pel is not None and femp is not None:
+            p = (pel + femp) / 2.0
+            positions[f"{side_code}_hip"] = (float(p[ix]), float(p[iy]))
+        if femp is not None and tibp is not None:
+            p = (femp + tibp) / 2.0
+            positions[f"{side_code}_knee"] = (float(p[ix]), float(p[iy]))
+        if tibp is not None and footp is not None:
+            p = (tibp + footp) / 2.0
+            positions[f"{side_code}_ankle"] = (float(p[ix]), float(p[iy]))
+    return positions
+
+
+def joint_overlay_positions_3d(row: pd.Series, center_on_pelvis: bool = True) -> Dict[str, Tuple[float, float, float]]:
+    positions = {}
+    for side_code, fem, tib, foot in [("L", "LFE", "LTI", "LFO"), ("R", "RFE", "RTI", "RFO")]:
+        pel = nexus_segment_point(row, "PEL", center_on_pelvis=center_on_pelvis)
+        femp = nexus_segment_point(row, fem, center_on_pelvis=center_on_pelvis)
+        tibp = nexus_segment_point(row, tib, center_on_pelvis=center_on_pelvis)
+        footp = nexus_segment_point(row, foot, center_on_pelvis=center_on_pelvis)
+        if pel is not None and femp is not None:
+            p = (pel + femp) / 2.0
+            positions[f"{side_code}_hip"] = (float(p[0]), float(p[1]), float(p[2]))
+        if femp is not None and tibp is not None:
+            p = (femp + tibp) / 2.0
+            positions[f"{side_code}_knee"] = (float(p[0]), float(p[1]), float(p[2]))
+        if tibp is not None and footp is not None:
+            p = (tibp + footp) / 2.0
+            positions[f"{side_code}_ankle"] = (float(p[0]), float(p[1]), float(p[2]))
+    return positions
+
+
+def plot_nexus_model_2d(
+    raw_angles: pd.DataFrame,
+    frame: int,
+    plane: str = "X-Z",
+    side: str = "Ambos",
+    center_on_pelvis: bool = True,
+    overlay_family: str = "Flexión y extensión",
+) -> Optional[go.Figure]:
+    row = nexus_row_by_frame(raw_angles, frame)
+    if row is None:
+        return None
+    ix, iy, x_title, y_title = plane_indices(plane)
+    fig = go.Figure()
+    drawn = 0
+
+    for label, seq in NEXUS_SEGMENT_SEQUENCES:
+        if side == "Izquierdo" and label != "Izquierdo":
+            continue
+        if side == "Derecho" and label != "Derecho":
+            continue
+        xs, ys, txt = [], [], []
+        for seg in seq:
+            p = nexus_segment_point(row, seg, center_on_pelvis=center_on_pelvis)
+            if p is not None:
+                xs.append(p[ix])
+                ys.append(p[iy])
+                txt.append(seg)
+        if len(xs) >= 2:
+            color = COLORS["primary"] if label == "Izquierdo" else COLORS["secondary"]
+            fig.add_trace(go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines+markers+text",
+                text=txt,
+                textposition="top center",
+                name=label,
+                line=dict(width=7, color=color),
+                marker=dict(size=9, color=color),
+                showlegend=True,
+            ))
+            drawn += 1
+
+    if drawn == 0:
+        return None
+
+    values = overlay_component_values(raw_angles, frame, overlay_family)
+    positions = joint_overlay_positions_2d(row, ix, iy, center_on_pelvis=center_on_pelvis)
+
+    for side_code, color in [("L", COLORS["primary"]), ("R", COLORS["secondary"])]:
+        if side == "Izquierdo" and side_code != "L":
+            continue
+        if side == "Derecho" and side_code != "R":
+            continue
+        for joint_key, short_label, shift in [("hip", "Cad", 16), ("knee", "Rod", 16), ("ankle", "Tob", -18)]:
+            pos = positions.get(f"{side_code}_{joint_key}")
+            val = values.get(side_code, {}).get(joint_key, np.nan)
+            if pos is None or not np.isfinite(val):
+                continue
+            fig.add_annotation(
+                x=pos[0],
+                y=pos[1],
+                text=f"{short_label}: {val:.1f}°",
+                showarrow=False,
+                bgcolor="rgba(13,27,42,0.88)",
+                bordercolor=color,
+                borderwidth=1.2,
+                font=dict(color="#ffffff", size=11),
+                align="center",
+                yshift=shift,
+            )
+
+    x_range, y_range = nexus_model_limits(raw_angles, center_on_pelvis=center_on_pelvis, axes=(ix, iy))
+    fig.update_layout(**base_layout(f"Modelo Nexus 2D | Frame {int(frame)} | {overlay_family}", 560))
+    fig.update_xaxes(title_text=x_title, range=x_range)
+    fig.update_yaxes(title_text=y_title, range=y_range, scaleanchor="x", scaleratio=1)
+    return fig
+
+
+def plot_nexus_model_3d(
+    raw_angles: pd.DataFrame,
+    frame: int,
+    side: str = "Ambos",
+    center_on_pelvis: bool = True,
+    overlay_family: str = "Flexión y extensión",
+) -> Optional[go.Figure]:
+    row = nexus_row_by_frame(raw_angles, frame)
+    if row is None:
+        return None
+
+    fig = go.Figure()
+    drawn = 0
+    for label, seq in NEXUS_SEGMENT_SEQUENCES:
+        if side == "Izquierdo" and label != "Izquierdo":
+            continue
+        if side == "Derecho" and label != "Derecho":
+            continue
+        xs, ys, zs, txt = [], [], [], []
+        for seg in seq:
+            p = nexus_segment_point(row, seg, center_on_pelvis=center_on_pelvis)
+            if p is not None:
+                xs.append(p[0])
+                ys.append(p[1])
+                zs.append(p[2])
+                txt.append(seg)
+        if len(xs) >= 2:
+            color = COLORS["primary"] if label == "Izquierdo" else COLORS["secondary"]
+            fig.add_trace(go.Scatter3d(
+                x=xs,
+                y=ys,
+                z=zs,
+                mode="lines+markers+text",
+                text=txt,
+                textposition="top center",
+                name=label,
+                line=dict(width=7, color=color),
+                marker=dict(size=5, color=color),
+                showlegend=True,
+            ))
+            drawn += 1
+
+    if drawn == 0:
+        return None
+
+    values = overlay_component_values(raw_angles, frame, overlay_family)
+    positions = joint_overlay_positions_3d(row, center_on_pelvis=center_on_pelvis)
+    for side_code in ["L", "R"]:
+        if side == "Izquierdo" and side_code != "L":
+            continue
+        if side == "Derecho" and side_code != "R":
+            continue
+        xs, ys, zs, txt = [], [], [], []
+        for joint_key, short_label in [("hip", "Cad"), ("knee", "Rod"), ("ankle", "Tob")]:
+            pos = positions.get(f"{side_code}_{joint_key}")
+            val = values.get(side_code, {}).get(joint_key, np.nan)
+            if pos is None or not np.isfinite(val):
+                continue
+            xs.append(pos[0]); ys.append(pos[1]); zs.append(pos[2])
+            txt.append(f"{short_label}: {val:.1f}°")
+        if xs:
+            fig.add_trace(go.Scatter3d(
+                x=xs,
+                y=ys,
+                z=zs,
+                mode="text",
+                text=txt,
+                textfont=dict(color="#ffffff", size=11),
+                showlegend=False,
+            ))
+
+    x_range, _ = nexus_model_limits(raw_angles, center_on_pelvis=center_on_pelvis, axes=(0, 2))
+    y_range, z_range = nexus_model_limits(raw_angles, center_on_pelvis=center_on_pelvis, axes=(1, 2))
+    fig.update_layout(**base_layout(f"Modelo Nexus 3D | Frame {int(frame)} | {overlay_family}", 620))
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(title="X/TX (mm)", range=x_range, gridcolor=COLORS["grid"]),
+            yaxis=dict(title="Y/TY (mm)", range=y_range, gridcolor=COLORS["grid"]),
+            zaxis=dict(title="Z/TZ (mm)", range=z_range, gridcolor=COLORS["grid"]),
+            aspectmode="data",
+            camera=dict(eye=dict(x=1.7, y=1.45, z=0.95), projection=dict(type="orthographic")),
+        ),
+        uirevision="nexus_model_static",
+    )
+    return fig
+
+
+
+
+def _nexus_visible_sides(side: str) -> List[Tuple[str, str, List[str], str]]:
+    data = [
+        ("L", "Izquierdo", ["PEL", "LFE", "LTI", "LFO", "LTO"], COLORS["primary"]),
+        ("R", "Derecho", ["PEL", "RFE", "RTI", "RFO", "RTO"], COLORS["secondary"]),
+    ]
+    if side == "Izquierdo":
+        return [data[0]]
+    if side == "Derecho":
+        return [data[1]]
+    return data
+
+
+def nexus_model_2d_traces_for_frame(
+    raw_angles: pd.DataFrame,
+    frame: int,
+    plane: str = "X-Z",
+    side: str = "Ambos",
+    center_on_pelvis: bool = True,
+    overlay_family: str = "Flexión y extensión",
+) -> List[go.Scatter]:
+    row = nexus_row_by_frame(raw_angles, frame)
+    ix, iy, _, _ = plane_indices(plane)
+    traces = []
+    if row is None:
+        return traces
+
+    values = overlay_component_values(raw_angles, frame, overlay_family)
+    positions = joint_overlay_positions_2d(row, ix, iy, center_on_pelvis=center_on_pelvis)
+
+    for side_code, side_name, seq, color in _nexus_visible_sides(side):
+        xs, ys, txt = [], [], []
+        for seg in seq:
+            p = nexus_segment_point(row, seg, center_on_pelvis=center_on_pelvis)
+            if p is not None:
+                xs.append(p[ix])
+                ys.append(p[iy])
+                txt.append(seg)
+
+        traces.append(go.Scatter(
+            x=xs,
+            y=ys,
+            mode="lines+markers+text",
+            text=txt,
+            textposition="top center",
+            name=side_name,
+            line=dict(width=7, color=color),
+            marker=dict(size=9, color=color),
+            showlegend=True,
+        ))
+
+        tx, ty, tt = [], [], []
+        for joint_key, short_label in [("hip", "Cad"), ("knee", "Rod"), ("ankle", "Tob")]:
+            pos = positions.get(f"{side_code}_{joint_key}")
+            val = values.get(side_code, {}).get(joint_key, np.nan)
+            if pos is None or not np.isfinite(val):
+                continue
+            tx.append(pos[0])
+            ty.append(pos[1])
+            tt.append(f"{short_label}: {val:.1f}°")
+
+        traces.append(go.Scatter(
+            x=tx,
+            y=ty,
+            mode="text",
+            text=tt,
+            textposition="middle center",
+            textfont=dict(color="#ffffff", size=12),
+            name=f"Ángulos {side_name}",
+            showlegend=False,
+        ))
+
+    return traces
+
+
+def nexus_model_3d_traces_for_frame(
+    raw_angles: pd.DataFrame,
+    frame: int,
+    side: str = "Ambos",
+    center_on_pelvis: bool = True,
+    overlay_family: str = "Flexión y extensión",
+) -> List[go.Scatter3d]:
+    row = nexus_row_by_frame(raw_angles, frame)
+    traces = []
+    if row is None:
+        return traces
+
+    values = overlay_component_values(raw_angles, frame, overlay_family)
+    positions = joint_overlay_positions_3d(row, center_on_pelvis=center_on_pelvis)
+
+    for side_code, side_name, seq, color in _nexus_visible_sides(side):
+        xs, ys, zs, txt = [], [], [], []
+        for seg in seq:
+            p = nexus_segment_point(row, seg, center_on_pelvis=center_on_pelvis)
+            if p is not None:
+                xs.append(p[0])
+                ys.append(p[1])
+                zs.append(p[2])
+                txt.append(seg)
+
+        traces.append(go.Scatter3d(
+            x=xs,
+            y=ys,
+            z=zs,
+            mode="lines+markers+text",
+            text=txt,
+            textposition="top center",
+            name=side_name,
+            line=dict(width=7, color=color),
+            marker=dict(size=5, color=color),
+            showlegend=True,
+        ))
+
+        tx, ty, tz, tt = [], [], [], []
+        for joint_key, short_label in [("hip", "Cad"), ("knee", "Rod"), ("ankle", "Tob")]:
+            pos = positions.get(f"{side_code}_{joint_key}")
+            val = values.get(side_code, {}).get(joint_key, np.nan)
+            if pos is None or not np.isfinite(val):
+                continue
+            tx.append(pos[0])
+            ty.append(pos[1])
+            tz.append(pos[2])
+            tt.append(f"{short_label}: {val:.1f}°")
+
+        traces.append(go.Scatter3d(
+            x=tx,
+            y=ty,
+            z=tz,
+            mode="text",
+            text=tt,
+            textfont=dict(color="#ffffff", size=12),
+            name=f"Ángulos {side_name}",
+            showlegend=False,
+        ))
+
+    return traces
+
+
+def plot_nexus_model_2d_animation(
+    raw_angles: pd.DataFrame,
+    frames_list: List[int],
+    plane: str = "X-Z",
+    side: str = "Ambos",
+    center_on_pelvis: bool = True,
+    overlay_family: str = "Flexión y extensión",
+    frame_duration_ms: int = 45,
+) -> Optional[go.Figure]:
+    if raw_angles is None or raw_angles.empty or not frames_list:
+        return None
+
+    ix, iy, x_title, y_title = plane_indices(plane)
+    first_frame = int(frames_list[0])
+    initial_traces = nexus_model_2d_traces_for_frame(
+        raw_angles, first_frame, plane=plane, side=side,
+        center_on_pelvis=center_on_pelvis, overlay_family=overlay_family,
+    )
+    if not initial_traces:
+        return None
+
+    plotly_frames = []
+    for fr in frames_list:
+        plotly_frames.append(go.Frame(
+            data=nexus_model_2d_traces_for_frame(
+                raw_angles, int(fr), plane=plane, side=side,
+                center_on_pelvis=center_on_pelvis, overlay_family=overlay_family,
+            ),
+            name=str(int(fr)),
+            layout=go.Layout(title_text=f"Modelo Nexus 2D | Frame {int(fr)} | {overlay_family}"),
+        ))
+
+    steps = [
+        dict(
+            method="animate",
+            args=[[str(int(fr))], dict(mode="immediate", frame=dict(duration=0, redraw=True), transition=dict(duration=0))],
+            label=str(int(fr)),
+        )
+        for fr in frames_list
+    ]
+
+    x_range, y_range = nexus_model_limits(raw_angles, center_on_pelvis=center_on_pelvis, axes=(ix, iy))
+    fig = go.Figure(data=initial_traces, frames=plotly_frames)
+    fig.update_layout(**base_layout(f"Modelo Nexus 2D | Frame {first_frame} | {overlay_family}", 560))
+    fig.update_xaxes(title_text=x_title, range=x_range)
+    fig.update_yaxes(title_text=y_title, range=y_range, scaleanchor="x", scaleratio=1)
+    fig.update_layout(
+        updatemenus=[dict(
+            type="buttons",
+            direction="left",
+            x=0.02,
+            y=1.12,
+            showactive=False,
+            buttons=[
+                dict(
+                    label="▶",
+                    method="animate",
+                    args=[None, dict(frame=dict(duration=int(frame_duration_ms), redraw=True), transition=dict(duration=0), fromcurrent=True, mode="immediate")],
+                ),
+                dict(
+                    label="⏸",
+                    method="animate",
+                    args=[[None], dict(frame=dict(duration=0, redraw=False), mode="immediate")],
+                ),
+            ],
+        )],
+        sliders=[dict(
+            active=0,
+            currentvalue=dict(prefix="Frame: ", visible=True, font=dict(color=COLORS["text"], size=13)),
+            pad=dict(t=35, b=10),
+            len=0.96,
+            x=0.02,
+            y=0,
+            steps=steps,
+        )],
+    )
+    return fig
+
+
+def plot_nexus_model_3d_animation(
+    raw_angles: pd.DataFrame,
+    frames_list: List[int],
+    side: str = "Ambos",
+    center_on_pelvis: bool = True,
+    overlay_family: str = "Flexión y extensión",
+    frame_duration_ms: int = 45,
+) -> Optional[go.Figure]:
+    if raw_angles is None or raw_angles.empty or not frames_list:
+        return None
+
+    first_frame = int(frames_list[0])
+    initial_traces = nexus_model_3d_traces_for_frame(
+        raw_angles, first_frame, side=side,
+        center_on_pelvis=center_on_pelvis, overlay_family=overlay_family,
+    )
+    if not initial_traces:
+        return None
+
+    plotly_frames = []
+    for fr in frames_list:
+        plotly_frames.append(go.Frame(
+            data=nexus_model_3d_traces_for_frame(
+                raw_angles, int(fr), side=side,
+                center_on_pelvis=center_on_pelvis, overlay_family=overlay_family,
+            ),
+            name=str(int(fr)),
+            layout=go.Layout(title_text=f"Modelo Nexus 3D | Frame {int(fr)} | {overlay_family}"),
+        ))
+
+    steps = [
+        dict(
+            method="animate",
+            args=[[str(int(fr))], dict(mode="immediate", frame=dict(duration=0, redraw=True), transition=dict(duration=0))],
+            label=str(int(fr)),
+        )
+        for fr in frames_list
+    ]
+
+    x_range, _ = nexus_model_limits(raw_angles, center_on_pelvis=center_on_pelvis, axes=(0, 2))
+    y_range, z_range = nexus_model_limits(raw_angles, center_on_pelvis=center_on_pelvis, axes=(1, 2))
+    fig = go.Figure(data=initial_traces, frames=plotly_frames)
+    fig.update_layout(**base_layout(f"Modelo Nexus 3D | Frame {first_frame} | {overlay_family}", 620))
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(title="X/TX (mm)", range=x_range, gridcolor=COLORS["grid"]),
+            yaxis=dict(title="Y/TY (mm)", range=y_range, gridcolor=COLORS["grid"]),
+            zaxis=dict(title="Z/TZ (mm)", range=z_range, gridcolor=COLORS["grid"]),
+            aspectmode="data",
+            camera=dict(eye=dict(x=1.7, y=1.45, z=0.95), projection=dict(type="orthographic")),
+        ),
+        uirevision="nexus_model_static",
+        updatemenus=[dict(
+            type="buttons",
+            direction="left",
+            x=0.02,
+            y=1.08,
+            showactive=False,
+            buttons=[
+                dict(
+                    label="▶",
+                    method="animate",
+                    args=[None, dict(frame=dict(duration=int(frame_duration_ms), redraw=True), transition=dict(duration=0), fromcurrent=True, mode="immediate")],
+                ),
+                dict(
+                    label="⏸",
+                    method="animate",
+                    args=[[None], dict(frame=dict(duration=0, redraw=False), mode="immediate")],
+                ),
+            ],
+        )],
+        sliders=[dict(
+            active=0,
+            currentvalue=dict(prefix="Frame: ", visible=True, font=dict(color=COLORS["text"], size=13)),
+            pad=dict(t=35, b=10),
+            len=0.96,
+            x=0.02,
+            y=0,
+            steps=steps,
+        )],
+    )
+    return fig
+
+
 # =============================================================================
 # Interfaz principal
 # =============================================================================
@@ -2101,6 +3061,7 @@ def main():
         """
         <div class="hero-header">
             <h1>Plataforma General de Análisis Biomecánico de Saltos</h1>
+            <p>Fuerza + cinemática clínica desde Nexus Model Outputs</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -2109,7 +3070,14 @@ def main():
     with st.sidebar:
         st.markdown("## ⚙️ Configuración")
         force_file = st.file_uploader("Archivo de FUERZA.csv", type=["csv"], key="force")
-        traj_file = st.file_uploader("Archivo de TRAYECTORIA.csv (opcional)", type=["csv"], key="traj")
+        angles_file = st.file_uploader("Archivo de ÁNGULOS Nexus.csv / Model Outputs", type=["csv"], key="angles")
+        traj_file = st.file_uploader("Archivo de TRAYECTORIA.csv (opcional / validación técnica)", type=["csv"], key="traj")
+        clinical_jump_type = st.selectbox(
+            "Tipo de salto para resumen clínico",
+            ["Salto carpado", "Salto corza"],
+            index=0,
+            key="clinical_jump_type_single",
+        )
         st.markdown("---")
         mass_input = st.number_input("Masa corporal real (kg). Dejar 0 para estimar", min_value=0.0, max_value=250.0, value=0.0, step=0.5)
         fs_force = st.number_input("Frecuencia de fuerza (Hz)", min_value=100, max_value=5000, value=1000, step=100)
@@ -2129,8 +3097,8 @@ def main():
     # Por eso los resultados del análisis se guardan en session_state. Así el usuario
     # puede mover el visualizador 2D/3D sin tener que volver a cargar y calcular.
     if run:
-        if force_file is None:
-            st.error("Debes cargar el archivo de fuerza para continuar.")
+        if force_file is None or angles_file is None:
+            st.error("Debes cargar el archivo de fuerza y el archivo de ángulos Nexus para continuar.")
             return
 
         try:
@@ -2186,10 +3154,23 @@ def main():
         )
         all_warnings.extend(res.get("warnings", []))
 
+        raw_angles = None
+        nexus_meta = {}
+        nexus_clin = pd.DataFrame()
+        try:
+            angles_bytes = angles_file.read()
+            raw_angles, nexus_meta = parse_nexus_model_outputs(angles_bytes)
+            nexus_clin = build_nexus_clinical_df(raw_angles, normalize_angles=False)
+            kine_qc_rows: List[Dict] = validate_nexus_angles(raw_angles)
+        except Exception as e:
+            st.error(f"Error procesando ángulos Nexus: {e}")
+            st.exception(e)
+            return
+
         traj_clean = None
-        angles_df = None
+        geom_angles_df = None
         marker_qdf = pd.DataFrame()
-        kine_qc_rows: List[Dict] = []
+        # La trayectoria ya no alimenta la cinemática clínica. Solo se conserva como apoyo técnico opcional.
         if traj_file is not None:
             try:
                 traj_bytes = traj_file.read()
@@ -2199,10 +3180,10 @@ def main():
                     first_force_frame=safe_float(raw_force["Frame"].iloc[0]),
                     max_interp_gap=int(max_interp_gap), treat_zero_as_missing=bool(treat_zero),
                 )
-                traj_clean, angles_df, kine_qc_rows, kin_warnings = compute_kinematics(traj_clean, marker_qdf)
+                traj_clean, geom_angles_df, geom_qc_rows, kin_warnings = compute_kinematics(traj_clean, marker_qdf)
                 all_warnings.extend(traj_warnings + clean_warnings + kin_warnings)
             except Exception as e:
-                all_warnings.append(f"No se pudo procesar trayectoria: {e}")
+                all_warnings.append(f"No se pudo procesar trayectoria opcional: {e}")
 
         st.session_state["analysis_payload"] = {
             "f": f,
@@ -2211,14 +3192,17 @@ def main():
             "res": res,
             "all_warnings": all_warnings,
             "traj_clean": traj_clean,
-            "angles_df": angles_df,
+            "geom_angles_df": geom_angles_df,
+            "raw_angles": raw_angles,
+            "nexus_meta": nexus_meta,
+            "nexus_clin": nexus_clin,
             "marker_qdf": marker_qdf,
             "kine_qc_rows": kine_qc_rows,
         }
 
     elif "analysis_payload" not in st.session_state or st.session_state.get("analysis_payload") is None:
         info_box(
-            "Sube al menos el archivo de fuerza y presiona CALCULAR ANÁLISIS.",
+            "Sube el archivo de fuerza y el archivo de ángulos Nexus; luego presiona CALCULAR ANÁLISIS.",
             "info",
         )
         return
@@ -2230,7 +3214,10 @@ def main():
     res = payload["res"]
     all_warnings = payload["all_warnings"]
     traj_clean = payload["traj_clean"]
-    angles_df = payload["angles_df"]
+    geom_angles_df = payload.get("geom_angles_df")
+    raw_angles = payload["raw_angles"]
+    nexus_meta = payload.get("nexus_meta", {})
+    nexus_clin = payload["nexus_clin"]
     marker_qdf = payload["marker_qdf"]
     kine_qc_rows = payload["kine_qc_rows"]
 
@@ -2329,216 +3316,267 @@ def main():
         st.plotly_chart(fig_comp, use_container_width=True, key="forces_components")
 
     with tabs[3]:
-        section("Cinemática")
-        if traj_clean is None or angles_df is None:
-            info_box("No se cargó trayectoria o no pudo procesarse. El análisis de fuerza sigue siendo válido.", "warn")
+        section("Cinemática clínica basada en Nexus")
+        if raw_angles is None or raw_angles.empty or nexus_clin is None or nexus_clin.empty:
+            info_box("No se encontraron ángulos Nexus válidos. Revise que el archivo sea Model Outputs y contenga Hip/Knee/Ankle Angles.", "bad")
         else:
             clinical_jump_type = st.session_state.get("clinical_jump_type_single", "Salto carpado")
-            invert_anterior = st.session_state.get("clinical_invert_anterior", False)
-            clinical_df, clinical_notes = compute_clinical_angles(
-                traj_clean,
-                vertical_axis="Z",
-                invert_anterior=invert_anterior,
+
+            m1, m2, m3, m4 = st.columns(4)
+            m1.markdown(kpi("Frame inicial", int(nexus_clin["Frame"].min()), ""), unsafe_allow_html=True)
+            m2.markdown(kpi("Frame final", int(nexus_clin["Frame"].max()), ""), unsafe_allow_html=True)
+            m3.markdown(kpi("Muestras Nexus", len(nexus_clin), ""), unsafe_allow_html=True)
+            m4.markdown(kpi("Frecuencia", format_num(nexus_meta.get("Frecuencia (Hz)", np.nan), 1), "Hz"), unsafe_allow_html=True)
+
+            info_box(
+                "En esta sección los valores angulares clínicos provienen únicamente del archivo de ÁNGULOS Nexus / Model Outputs. "
+                "La trayectoria, si se carga, queda solo como validación técnica opcional y no se mezcla con el análisis clínico.",
+                "info",
             )
 
-            section("Ángulos articulares")
-            
+            section("Visualizador clínico del modelo Nexus")
+            model_frames = raw_angles["Frame"].dropna().astype(int).tolist()
+            segment_available = bool(nexus_segment_names(raw_angles))
 
-            col1, col2 = st.columns(2)
-            with col1:
-                fig_l = plot_angles(angles_df, "L")
-                if fig_l is not None:
-                    st.plotly_chart(fig_l, use_container_width=True, key="kinematics_angles_left_relative")
-                else:
-                    info_box("No hay ángulos izquierdos válidos.", "warn")
-            with col2:
-                fig_r = plot_angles(angles_df, "R")
-                if fig_r is not None:
-                    st.plotly_chart(fig_r, use_container_width=True, key="kinematics_angles_right_relative")
-                else:
-                    info_box("No hay ángulos derechos válidos.", "warn")
-
-            section("Visualizador interactivo del movimiento registrado")
-            
-
-            viewer_control = st.radio(
-                "Tipo de control del visualizador",
-                ["Video / reproducción continua", "Frame manual"],
-                horizontal=True,
-                key="viewer_control_type",
-            )
-
-            vcols = st.columns([1, 1, 1])
-            with vcols[0]:
-                viewer_mode = st.selectbox("Vista", ["2D", "3D"], index=0, key="viewer_mode")
-            with vcols[1]:
-                viewer_side = st.selectbox("Segmentos", ["Ambos", "Izquierdo", "Derecho"], index=0, key="viewer_side")
-            with vcols[2]:
-                plane = st.selectbox(
-                    "Plano 2D",
-                    ["X-Z", "Y-Z", "X-Y"],
-                    index=0,
-                    key="viewer_plane",
-                    help="X-Z o Y-Z suelen ser las mejores vistas laterales; depende del sistema de coordenadas Vicon usado.",
-                    disabled=(viewer_mode != "2D"),
-                )
-
-            opt_cols = st.columns([1, 1, 1])
-            with opt_cols[0]:
-                center_pelvis = st.checkbox(
-                    "Centrar en pelvis",
-                    value=True,
-                    key="viewer_center_pelvis",
-                    help="Recomendado para fisioterapia: evita que el esqueleto se desplace fuera de la gráfica y facilita ver la postura.",
-                )
-            with opt_cols[1]:
-                show_labels = st.checkbox("Mostrar nombres", value=False, key="viewer_show_labels")
-            with opt_cols[2]:
-                frame_duration_ms = st.slider(
-                    "Velocidad del video (ms/frame)",
-                    min_value=20, max_value=200, value=60, step=10,
-                    key="viewer_frame_duration_ms",
-                )
-
-            # Muestreo automático de frames para mantener fluida la app en la nube sin mostrar controles técnicos al usuario.
-            frame_stride = 1 if len(traj_clean) <= 250 else (2 if len(traj_clean) <= 600 else 3)
-
-            if viewer_control == "Video / reproducción continua":
-                if viewer_mode == "2D":
-                    fig_skel = plot_skeleton_2d_animation(
-                        traj_clean, angles_df, clinical=clinical_df, jump_type=clinical_jump_type,
-                        plane=plane, side=viewer_side, center_on_pelvis=center_pelvis,
-                        show_labels=show_labels, stride=int(frame_stride),
-                        frame_duration_ms=int(frame_duration_ms),
-                    )
-                else:
-                    fig_skel = plot_skeleton_3d_animation(
-                        traj_clean, angles_df, clinical=clinical_df, jump_type=clinical_jump_type,
-                        side=viewer_side, center_on_pelvis=center_pelvis,
-                        show_labels=show_labels, stride=int(frame_stride),
-                        frame_duration_ms=int(frame_duration_ms),
-                    )
-
-                if fig_skel is not None:
-                    st.plotly_chart(
-                        fig_skel,
-                        use_container_width=True,
-                        key="kinematics_skeleton_video",
-                        config={"displayModeBar": True, "scrollZoom": True},
-                    )
-                    info_box(
-                        "Usa el botón ▶ para reproducir o ⏸ para pausar. También puedes mover el control inferior de la gráfica para revisar un instante específico.",
-                        "info",
-                    )
-                else:
-                    info_box("No se pudo generar el video del exoesqueleto. Revise que existan los marcadores necesarios.", "warn")
+            if not model_frames:
+                info_box("No se encontraron frames válidos en el archivo de ángulos Nexus.", "warn")
             else:
-                frame_idx = st.slider(
-                    "Frame / instante del movimiento",
-                    min_value=0, max_value=max(len(traj_clean) - 1, 0),
-                    value=0, step=1,
-                    key="viewer_frame_idx",
-                )
-                if viewer_mode == "2D":
-                    fig_skel = plot_skeleton_2d(
-                        traj_clean, frame_idx, plane=plane, side=viewer_side,
-                        center_on_pelvis=center_pelvis, show_labels=show_labels,
-                    )
-                else:
-                    fig_skel = plot_skeleton_3d(
-                        traj_clean, frame_idx, side=viewer_side,
-                        center_on_pelvis=center_pelvis, show_labels=show_labels,
-                    )
-
-                if fig_skel is not None:
-                    st.plotly_chart(fig_skel, use_container_width=True, key="kinematics_skeleton_manual")
-                else:
-                    info_box("No se pudo dibujar el exoesqueleto. Revise que existan marcadores LASI/RASI, LKNE/RKNE, LANK/RANK y LTOE/RTOE.", "warn")
-
-                current_clinical = current_clinical_angles_table(
-                    clinical_df, frame_idx, clinical_jump_type, viewer_side
-                )
-                if not current_clinical.empty:
-                    st.dataframe(current_clinical.round(2), use_container_width=True, hide_index=True)
-
-            section("Trayectoria vertical del Centro de Masa/Pelvis")
-            fig_com = plot_com(traj_clean, res)
-            if fig_com is not None:
-                st.plotly_chart(fig_com, use_container_width=True, key="kinematics_com")
-            else:
-                info_box("CoM/Pelvis no válido por falta de LASI/RASI o datos perdidos.", "warn")
-
-
-            section("Evaluación clínica por tipo de salto")
-
-            eval_cols = st.columns([1, 1])
-            with eval_cols[0]:
-                clinical_jump_type = st.radio(
-                    "Seleccion el tipo de salto a evaluar",
-                    ["Salto carpado", "Salto corza"],
+                control_mode = st.radio(
+                    "Control del visualizador",
+                    ["Reproducción con slider interno", "Frame manual"],
                     horizontal=True,
-                    key="clinical_jump_type_single",
+                    key="nexus_visualizer_control_mode",
                 )
 
-                clinical_jump_types = [clinical_jump_type]
+                vcols = st.columns([1, 1, 1, 1])
+                with vcols[0]:
+                    nexus_view_mode = st.selectbox("Vista", ["2D", "3D"], index=0, key="nexus_model_view")
+                with vcols[1]:
+                    nexus_side = st.selectbox("Segmentos", ["Ambos", "Izquierdo", "Derecho"], index=0, key="nexus_model_side")
+                with vcols[2]:
+                    nexus_plane = st.selectbox("Plano 2D", ["X-Z", "Y-Z", "X-Y"], index=0, key="nexus_model_plane", disabled=(nexus_view_mode != "2D"))
+                with vcols[3]:
+                    center_model = st.checkbox("Centrar en pelvis", value=True, key="nexus_model_center")
 
-            with eval_cols[1]:
-                invert_anterior = st.checkbox(
-                    "Invertir eje anterior de pelvis",
-                    value=False,
-                    key="clinical_invert_anterior",
-                    help="Activar solo si al revisar el video la flexión/extensión aparece invertida.",
-                )
+                opt_cols = st.columns([1, 1])
+                with opt_cols[0]:
+                    overlay_family = st.selectbox(
+                        "Ángulos mostrados dentro del dibujo",
+                        ["Flexión y extensión", "Abducción y aducción", "Rotación"],
+                        index=0,
+                        key="nexus_overlay_family",
+                    )
+                with opt_cols[1]:
+                    frame_duration_ms = st.slider(
+                        "Velocidad de reproducción (ms/frame)",
+                        min_value=20,
+                        max_value=200,
+                        value=50,
+                        step=10,
+                        key="nexus_internal_frame_duration",
+                    )
 
-            for note in clinical_notes:
-                info_box(note, "info")
+                if control_mode == "Frame manual":
+                    selected_review_frame = st.slider(
+                        "Frame para visualizar y revisar valores",
+                        min_value=int(min(model_frames)),
+                        max_value=int(max(model_frames)),
+                        value=int(min(model_frames)),
+                        step=1,
+                        key="nexus_model_frame",
+                    )
+                else:
+                    selected_review_frame = st.select_slider(
+                        "Frame para revisar la tabla",
+                        options=sorted(set(model_frames)),
+                        value=int(min(model_frames)),
+                        key="nexus_table_frame",
+                    )
 
-            if clinical_df.empty:
-                info_box("No se pudieron calcular variables clínicas por falta de marcadores.", "warn")
-            else:
-                for jump_type in clinical_jump_types:
-                    section(jump_type)
-                    clinical_summary = clinical_summary_by_jump(clinical_df, jump_type)
+                if segment_available:
+                    frames_for_plot = sorted(set(model_frames))
 
-                    if clinical_summary.empty:
-                        info_box(f"No existen datos suficientes para evaluar {jump_type}.", "warn")
+                    if control_mode == "Reproducción con slider interno":
+                        if nexus_view_mode == "2D":
+                            fig_model = plot_nexus_model_2d_animation(
+                                raw_angles,
+                                frames_for_plot,
+                                plane=nexus_plane,
+                                side=nexus_side,
+                                center_on_pelvis=center_model,
+                                overlay_family=overlay_family,
+                                frame_duration_ms=int(frame_duration_ms),
+                            )
+                        else:
+                            fig_model = plot_nexus_model_3d_animation(
+                                raw_angles,
+                                frames_for_plot,
+                                side=nexus_side,
+                                center_on_pelvis=center_model,
+                                overlay_family=overlay_family,
+                                frame_duration_ms=int(frame_duration_ms),
+                            )
                     else:
-                        st.dataframe(
-                            clinical_summary.round(2),
+                        if nexus_view_mode == "2D":
+                            fig_model = plot_nexus_model_2d(
+                                raw_angles,
+                                int(selected_review_frame),
+                                plane=nexus_plane,
+                                side=nexus_side,
+                                center_on_pelvis=center_model,
+                                overlay_family=overlay_family,
+                            )
+                        else:
+                            fig_model = plot_nexus_model_3d(
+                                raw_angles,
+                                int(selected_review_frame),
+                                side=nexus_side,
+                                center_on_pelvis=center_model,
+                                overlay_family=overlay_family,
+                            )
+
+                    if fig_model is not None:
+                        st.plotly_chart(
+                            fig_model,
                             use_container_width=True,
-                            hide_index=True,
+                            key="nexus_model_visualizer",
+                            config={"displayModeBar": True, "scrollZoom": True, "responsive": True},
                         )
-
-                with st.expander("Ver series clínicas completas"):
-                    st.dataframe(
-                        clinical_df.round(2),
-                        use_container_width=True,
-                        hide_index=True,
+                        if control_mode == "Reproducción con slider interno":
+                            info_box(
+                                "El slider interno de la gráfica se actualiza dentro de Plotly mientras se mueve, sin esperar a que Streamlit recalcule la página. "
+                                "La tabla inferior usa el selector 'Frame para revisar la tabla'.",
+                                "info",
+                            )
+                    else:
+                        info_box("No se pudo generar el visualizador con los centros de segmento del archivo Nexus.", "warn")
+                else:
+                    info_box(
+                        "El archivo de ángulos Nexus no contiene centros de segmento TX/TY/TZ suficientes para dibujar el modelo. "
+                        "Las curvas y tablas de ángulos sí están disponibles.",
+                        "warn",
                     )
 
-                    csv_clinical = clinical_df.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "⬇ Descargar variables clínicas",
-                        data=csv_clinical,
-                        file_name="variables_clinicas_salto.csv",
-                        mime="text/csv",
+                with st.expander("Interpretación de signos para la tabla del frame", expanded=False):
+                    s1, s2, s3, s4 = st.columns(4)
+                    with s1:
+                        hip_x_positive = st.selectbox("Cadera X positivo", ["Flexión", "Extensión"], index=0, key="hip_x_positive")
+                    with s2:
+                        knee_x_positive = st.selectbox("Rodilla X positivo", ["Flexión", "Extensión"], index=0, key="knee_x_positive")
+                    with s3:
+                        ankle_x_positive = st.selectbox("Tobillo X positivo", ["Dorsiflexión", "Plantiflexión"], index=0, key="ankle_x_positive")
+                    with s4:
+                        hip_y_positive = st.selectbox("Cadera Y positivo", ["Abducción", "Aducción"], index=0, key="hip_y_positive")
+
+                section("Valores Nexus del frame seleccionado")
+                detail_table = current_nexus_detail_table(
+                    raw_angles,
+                    int(selected_review_frame),
+                    side_filter=nexus_side,
+                    hip_x_positive=hip_x_positive,
+                    knee_x_positive=knee_x_positive,
+                    ankle_x_positive=ankle_x_positive,
+                    hip_y_positive=hip_y_positive,
+                )
+                if not detail_table.empty:
+                    st.dataframe(detail_table.round(2), use_container_width=True, hide_index=True)
+                else:
+                    info_box("No existen valores angulares Nexus suficientes para el frame seleccionado.", "warn")
+
+            section("Curvas articulares Nexus")
+            section("Flexión y extensión")
+            c1, c2 = st.columns(2)
+            with c1:
+                fig = plot_nexus_component(raw_angles, "L", "X", res)
+                if fig is not None:
+                    st.plotly_chart(fig, use_container_width=True, key="nexus_flex_left")
+            with c2:
+                fig = plot_nexus_component(raw_angles, "R", "X", res)
+                if fig is not None:
+                    st.plotly_chart(fig, use_container_width=True, key="nexus_flex_right")
+
+            section("Abducción y aducción")
+            c1, c2 = st.columns(2)
+            with c1:
+                fig = plot_nexus_component(raw_angles, "L", "Y", res)
+                if fig is not None:
+                    st.plotly_chart(fig, use_container_width=True, key="nexus_abd_left")
+            with c2:
+                fig = plot_nexus_component(raw_angles, "R", "Y", res)
+                if fig is not None:
+                    st.plotly_chart(fig, use_container_width=True, key="nexus_abd_right")
+
+            section("Rotación")
+            c1, c2 = st.columns(2)
+            with c1:
+                fig = plot_nexus_component(raw_angles, "L", "Z", res)
+                if fig is not None:
+                    st.plotly_chart(fig, use_container_width=True, key="nexus_rot_left")
+            with c2:
+                fig = plot_nexus_component(raw_angles, "R", "Z", res)
+                if fig is not None:
+                    st.plotly_chart(fig, use_container_width=True, key="nexus_rot_right")
+
+            section("Resumen clínico por tipo de salto")
+            stats = nexus_summary_by_jump(nexus_clin, clinical_jump_type)
+            if not stats.empty:
+                st.dataframe(stats.round(2), use_container_width=True, hide_index=True)
+            else:
+                info_box("No se encontraron variables suficientes para generar el resumen clínico del salto seleccionado.", "warn")
+
+            if traj_clean is not None:
+                section("Trayectoria auxiliar opcional")
+                fig_com = plot_com(traj_clean, res)
+                if fig_com is not None:
+                    st.plotly_chart(fig_com, use_container_width=True, key="kinematics_com_aux")
+                with st.expander("Comparación técnica opcional: ángulos geométricos por trayectoria"):
+                    info_box(
+                        "Esta tabla no se usa como fuente clínica principal. Solo sirve para documentar diferencias entre el cálculo geométrico y los ángulos Nexus.",
+                        "warn",
                     )
-    
+                    if geom_angles_df is not None and not geom_angles_df.empty:
+                        st.dataframe(geom_angles_df.head(500).round(2), use_container_width=True)
+                    else:
+                        st.write("No existen ángulos geométricos disponibles.")
+
     with tabs[4]:
         section("Datos procesados")
-        dataset = st.selectbox("Seleccionar tabla", ["Fuerza procesada", "Trayectoria limpia", "Calidad de marcadores"])
+        dataset = st.selectbox(
+            "Seleccionar tabla",
+            ["Fuerza procesada", "Ángulos Nexus procesados", "Model Outputs Nexus completo", "Trayectoria limpia (opcional)", "Ángulos geométricos (opcional)", "Calidad de marcadores"],
+        )
         if dataset == "Fuerza procesada":
             cols = [c for c in ["time", "Frame", "SubFrame", "GRF_x", "GRF_y", "GRF_z", "GRF_z_filt", "CoP_X", "CoP_Y"] if c in f.columns]
             st.dataframe(f[cols].head(500).round(4), use_container_width=True)
             csv = f[cols].to_csv(index=False).encode("utf-8")
             st.download_button("⬇ Descargar fuerza procesada", data=csv, file_name="fuerza_procesada.csv", mime="text/csv")
-        elif dataset == "Trayectoria limpia":
+
+        elif dataset == "Ángulos Nexus procesados":
+            st.dataframe(nexus_clin.head(500).round(4), use_container_width=True)
+            csv = nexus_clin.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇ Descargar ángulos Nexus procesados", data=csv, file_name="angulos_nexus_procesados.csv", mime="text/csv")
+
+        elif dataset == "Model Outputs Nexus completo":
+            st.dataframe(raw_angles.head(500).round(4), use_container_width=True)
+            csv = raw_angles.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇ Descargar Model Outputs procesado", data=csv, file_name="model_outputs_nexus_procesado.csv", mime="text/csv")
+
+        elif dataset == "Trayectoria limpia (opcional)":
             if traj_clean is not None:
                 st.dataframe(traj_clean.head(500).round(4), use_container_width=True)
                 csv = traj_clean.to_csv(index=False).encode("utf-8")
                 st.download_button("⬇ Descargar trayectoria limpia", data=csv, file_name="trayectoria_limpia.csv", mime="text/csv")
             else:
-                st.warning("No disponible.")
+                st.warning("No disponible porque no se cargó trayectoria.")
+
+        elif dataset == "Ángulos geométricos (opcional)":
+            if geom_angles_df is not None:
+                st.dataframe(geom_angles_df.head(500).round(4), use_container_width=True)
+                csv = geom_angles_df.to_csv(index=False).encode("utf-8")
+                st.download_button("⬇ Descargar ángulos geométricos", data=csv, file_name="angulos_geometricos_trayectoria.csv", mime="text/csv")
+            else:
+                st.warning("No disponible porque no se cargó trayectoria.")
+
         else:
             if not marker_qdf.empty:
                 st.dataframe(marker_qdf, use_container_width=True)
